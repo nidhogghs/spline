@@ -100,13 +100,20 @@ def main():
     seeds = [args.seed_start + i for i in range(args.n_seeds)]
     max_workers = max(1, int(args.max_workers))
 
+    print(f"[parallel] seeds={args.n_seeds} max_workers={max_workers} start={args.seed_start}")
     failures = []
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_run_one, seed, args, extra_args) for seed in seeds]
+        futures = {}
+        for seed in seeds:
+            print(f"[submit] seed={seed}")
+            futures[ex.submit(_run_one, seed, args, extra_args)] = seed
         for fut in as_completed(futures):
             seed, code = fut.result()
             if code != 0:
                 failures.append((seed, code))
+                print(f"[done] seed={seed} code={code} (failed)")
+            else:
+                print(f"[done] seed={seed} code=0")
 
     if failures:
         msg = ", ".join([f"seed={s} code={c}" for s, c in failures])

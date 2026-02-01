@@ -21,7 +21,7 @@ def true_beta_funcs_default(scales=None):
     return [
         lambda t: scales[0] * (-0.5 + 0.6 * np.cos(2 * np.pi * t)),
         lambda t: scales[1] * (-0.5 + 0.6 * np.cos(2 * np.pi * t)),
-        lambda t: scales[3] * (0.7 * np.sin(4 * np.pi * t)),
+        lambda t: scales[2] * (0.7 * np.sin(4 * np.pi * t)),
         lambda t: scales[3] * (0.7 * np.sin(4 * np.pi * t)),
         lambda t: scales[4] * (0.4 * np.cos(3 * np.pi * t)),
     ]
@@ -822,6 +822,14 @@ def _parse_list_float(s):
     return [float(x) for x in s.split(",") if x.strip() != ""]
 
 
+def _parse_interval(s):
+    parts = [p.strip() for p in s.split(",") if p.strip() != ""]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("Expected interval like 'a,b'.")
+    a, b = float(parts[0]), float(parts[1])
+    return (a, b)
+
+
 def _str2bool(s):
     if isinstance(s, bool):
         return s
@@ -838,6 +846,94 @@ def _extract_final_rmse(history):
         if isinstance(h, dict) and "train_rmse" in h:
             return float(h["train_rmse"]), float(h.get("t_end", 0.0))
     return None, None
+
+
+def _find_latest_checkpoint(checkpoint_dir):
+    if not os.path.isdir(checkpoint_dir):
+        return None
+    best = None
+    for name in os.listdir(checkpoint_dir):
+        if not name.startswith("ckpt_t") or not name.endswith(".json"):
+            continue
+        try:
+            t_val = int(name[len("ckpt_t"):-len(".json")])
+        except ValueError:
+            continue
+        npz = os.path.join(checkpoint_dir, f"ckpt_t{t_val}.npz")
+        if os.path.exists(npz):
+            best = t_val if (best is None or t_val > best) else best
+    return best
+
+
+def plot_interval(
+    trainer,
+    t_range,
+    out_path,
+    groups,
+    signal_idx=None,
+    beta_funcs=None,
+    show_true=False,
+    plot_y=False,
+    max_points=2000,
+):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    a, b = map(float, t_range)
+    if a > b:
+        a, b = b, a
+    a = max(0.0, a)
+    b = min(float(trainer.t_end), b)
+    if b <= a:
+        raise ValueError(f"Invalid interval after clamping: [{a}, {b}].")
+
+    t_grid = np.linspace(a, b, 1000)
+    beta_hat = trainer.eval_beta(t_grid)
+
+    nrows = len(groups) + (1 if plot_y else 0)
+    fig, axes = plt.subplots(nrows, 1, figsize=(8, 2.6 * nrows), sharex=True)
+    if nrows == 1:
+        axes = [axes]
+
+    for i, p in enumerate(groups):
+        ax = axes[i]
+        ax.plot(t_grid, beta_hat[:, p], label="beta_hat")
+        if show_true and beta_funcs is not None and signal_idx is not None:
+            if p in signal_idx:
+                j = signal_idx.index(p)
+                true_fn = beta_funcs[j % len(beta_funcs)]
+                ax.plot(t_grid, true_fn(t_grid), label="beta_true", linestyle="--")
+        ax.set_ylabel(f"beta[{p}]")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best")
+
+    if plot_y:
+        ax = axes[-1]
+        if trainer.t_all is not None and trainer.X_all is not None and trainer.y_all is not None:
+            mask = (trainer.t_all >= a) & (trainer.t_all <= b)
+            t_sel = trainer.t_all[mask]
+            X_sel = trainer.X_all[mask]
+            y_sel = trainer.y_all[mask]
+            if len(t_sel) > max_points:
+                idx = np.linspace(0, len(t_sel) - 1, max_points).astype(int)
+                t_sel = t_sel[idx]
+                X_sel = X_sel[idx]
+                y_sel = y_sel[idx]
+            y_hat = trainer.predict(t_sel, X_sel)
+            ax.scatter(t_sel, y_sel, s=8, alpha=0.6, label="y")
+            ax.scatter(t_sel, y_hat, s=8, alpha=0.6, label="y_hat")
+            ax.set_ylabel("y / y_hat")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="best")
+        else:
+            ax.text(0.5, 0.5, "No cached data in checkpoint", ha="center", va="center")
+            ax.set_axis_off()
+
+    axes[-1].set_xlabel("t")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 def main():
@@ -865,6 +961,12 @@ def main():
     parser.add_argument("--save-checkpoint-data", type=_str2bool, default=True,
                         help="Save full data in checkpoint (t_all/X_all/y_all).")
     parser.add_argument("--verbose", type=_str2bool, default=False, help="Print per-seed history in batch mode.")
+    parser.add_argument("--plot-interval", default="", help="Plot interval a,b and save image (skip training).")
+    parser.add_argument("--plot-out", default="plot_interval.png", help="Output image path for plot.")
+    parser.add_argument("--plot-groups", default="", help="Comma-separated group indices to plot.")
+    parser.add_argument("--plot-ckpt", type=int, default=0, help="Checkpoint t to load for plotting (0=latest).")
+    parser.add_argument("--plot-y", type=_str2bool, default=False, help="Plot y/y_hat scatter if data exists.")
+    parser.add_argument("--plot-show-true", type=_str2bool, default=False, help="Overlay true beta (if available).")
 
     args = parser.parse_args()
 
@@ -877,6 +979,42 @@ def main():
     else:
         tag = args.tag.strip()
         base_dir = f"checkpoints_vcm_{tag}" if tag else "checkpoints_vcm"
+
+    if args.plot_interval:
+        if args.checkpoint_dir:
+            checkpoint_dir = args.checkpoint_dir
+        else:
+            tag = args.tag.strip()
+            checkpoint_dir = f"checkpoints_vcm_{tag}" if tag else "checkpoints_vcm"
+
+        if args.plot_ckpt > 0:
+            ckpt_t = int(args.plot_ckpt)
+        else:
+            ckpt_t = _find_latest_checkpoint(checkpoint_dir)
+            if ckpt_t is None:
+                raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}.")
+
+        ckpt_prefix = os.path.join(checkpoint_dir, f"ckpt_t{ckpt_t}")
+        trainer = IncrementalVCMTrainer.load_checkpoint(ckpt_prefix)
+
+        if args.plot_groups.strip():
+            groups = _parse_list_int(args.plot_groups)
+        else:
+            groups = signal_idx
+
+        t_range = _parse_interval(args.plot_interval)
+        plot_interval(
+            trainer,
+            t_range=t_range,
+            out_path=args.plot_out,
+            groups=groups,
+            signal_idx=signal_idx,
+            beta_funcs=beta_funcs,
+            show_true=bool(args.plot_show_true),
+            plot_y=bool(args.plot_y),
+        )
+        print(f"plot_saved={args.plot_out}")
+        return
 
     n_seeds = int(args.n_seeds)
     if n_seeds <= 1:
