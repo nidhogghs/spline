@@ -425,7 +425,7 @@ class IncrementalVCMTrainer:
         self.y_all = None
 
     # ---------- checkpoint I/O ----------
-    def save_checkpoint(self, prefix_path):
+    def save_checkpoint(self, prefix_path, save_data=True):
         """
         Save: model state + accumulated data.
         Two files:
@@ -448,16 +448,26 @@ class IncrementalVCMTrainer:
         coef_mat = np.stack(self.coef_blocks, axis=0)  # (P, m)
 
         os.makedirs(os.path.dirname(prefix_path) or ".", exist_ok=True)
-        np.savez_compressed(
-            prefix_path + ".npz",
-            t_all=self.t_all,
-            X_all=self.X_all,
-            y_all=self.y_all,
-            knots=self.knots,
-            coef_mat=coef_mat,
-        )
+        save_data = bool(save_data)
+        if save_data:
+            np.savez_compressed(
+                prefix_path + ".npz",
+                t_all=self.t_all,
+                X_all=self.X_all,
+                y_all=self.y_all,
+                knots=self.knots,
+                coef_mat=coef_mat,
+            )
+        else:
+            # Save model state only; data will be regenerated if needed.
+            np.savez_compressed(
+                prefix_path + ".npz",
+                knots=self.knots,
+                coef_mat=coef_mat,
+            )
 
         with open(prefix_path + ".json", "w", encoding="utf-8") as f:
+            meta["save_data"] = save_data
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
     @classmethod
@@ -475,9 +485,14 @@ class IncrementalVCMTrainer:
         )
 
         pack = np.load(prefix_path + ".npz", allow_pickle=False)
-        obj.t_all = pack["t_all"]
-        obj.X_all = pack["X_all"]
-        obj.y_all = pack["y_all"]
+        if "t_all" in pack and "X_all" in pack and "y_all" in pack:
+            obj.t_all = pack["t_all"]
+            obj.X_all = pack["X_all"]
+            obj.y_all = pack["y_all"]
+        else:
+            obj.t_all = None
+            obj.X_all = None
+            obj.y_all = None
         obj.knots = pack["knots"]
         coef_mat = pack["coef_mat"]  # (P, m)
         obj.coef_blocks = [coef_mat[p].copy() for p in range(coef_mat.shape[0])]
@@ -658,6 +673,8 @@ def run_or_resume_incremental(
     use_1se=True,
     r_relax=2,
     use_adaptive_cn=True,
+    save_checkpoints=True,
+    save_checkpoint_data=True,
 ):
     """
     Stage-wise driver with checkpoint reuse:
@@ -668,16 +685,21 @@ def run_or_resume_incremental(
     Checkpoint naming:
       ckpt_t1, ckpt_t2, ..., where tX means fitted on [0, X].
     """
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    if save_checkpoints:
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
-    def ckpt_path(t_end):
-        return os.path.join(checkpoint_dir, f"ckpt_t{int(round(t_end))}")
+        def ckpt_path(t_end):
+            return os.path.join(checkpoint_dir, f"ckpt_t{int(round(t_end))}")
 
-    # Find the largest existing checkpoint <= t_final
-    existing = []
-    for s in range(1, int(round(t_final)) + 1):
-        if os.path.exists(ckpt_path(s) + ".json") and os.path.exists(ckpt_path(s) + ".npz"):
-            existing.append(s)
+        # Find the largest existing checkpoint <= t_final
+        existing = []
+        for s in range(1, int(round(t_final)) + 1):
+            if os.path.exists(ckpt_path(s) + ".json") and os.path.exists(ckpt_path(s) + ".npz"):
+                existing.append(s)
+    else:
+        def ckpt_path(_t_end):
+            return ""
+        existing = []
 
     sim = VCMSimulator(P=P, signal_idx=signal_idx, beta_funcs=beta_funcs, sigma=sigma,
                        seed_base=seed_data, standardize_X=True)
@@ -696,9 +718,23 @@ def run_or_resume_incremental(
     if start_end < 1.0 - 1e-12:
         t0, X0, y0, _ = sim.sample_segment(0.0, 1.0, n_per_segment, segment_id=0)
         info1 = trainer.fit_stage1(t0, X0, y0)
-        trainer.save_checkpoint(ckpt_path(1.0))
+        if save_checkpoints:
+            trainer.save_checkpoint(ckpt_path(1.0), save_data=save_checkpoint_data)
         history.append(info1)
         start_end = 1.0
+    elif trainer.t_all is None:
+        # Rebuild cached data from seeds for resume (model-only checkpoint).
+        t_list = []
+        X_list = []
+        y_list = []
+        for s in range(int(round(start_end))):
+            t_seg, X_seg, y_seg, _ = sim.sample_segment(float(s), float(s + 1), n_per_segment, segment_id=s)
+            t_list.append(t_seg)
+            X_list.append(X_seg)
+            y_list.append(y_seg)
+        trainer.t_all = np.concatenate(t_list, axis=0)
+        trainer.X_all = np.vstack(X_list)
+        trainer.y_all = np.concatenate(y_list, axis=0)
 
     # Extend stage-by-stage
     current_end = start_end
@@ -710,7 +746,8 @@ def run_or_resume_incremental(
         info = trainer.extend_one_stage(
             next_end, t_seg, X_seg, y_seg, use_adaptive_cn=use_adaptive_cn
         )
-        trainer.save_checkpoint(ckpt_path(next_end))
+        if save_checkpoints:
+            trainer.save_checkpoint(ckpt_path(next_end), save_data=save_checkpoint_data)
         history.append(info)
         current_end = next_end
 
@@ -796,6 +833,13 @@ def _str2bool(s):
     raise argparse.ArgumentTypeError("Expected a boolean value.")
 
 
+def _extract_final_rmse(history):
+    for h in reversed(history):
+        if isinstance(h, dict) and "train_rmse" in h:
+            return float(h["train_rmse"]), float(h.get("t_end", 0.0))
+    return None, None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Incremental VCM training (checkpointed).")
     parser.add_argument("--tag", default="default", help="Experiment tag for checkpoint folder name.")
@@ -809,11 +853,18 @@ def main():
     parser.add_argument("--k", type=int, default=3, help="Spline degree.")
     parser.add_argument("--n-inner-per-unit", type=int, default=10, help="Internal knots per unit interval.")
     parser.add_argument("--seed-data", type=int, default=0, help="Seed for data generation.")
+    parser.add_argument("--seed-data-start", type=int, default=0, help="Start seed for batch runs.")
+    parser.add_argument("--n-seeds", type=int, default=1, help="Number of seeds to run.")
     parser.add_argument("--seed-cv", type=int, default=2025, help="Seed for CV splits.")
     parser.add_argument("--use-1se", type=_str2bool, default=True, help="Use 1-SE rule for lambda selection.")
     parser.add_argument("--r-relax", type=int, default=2, help="Relax count near boundary.")
     parser.add_argument("--use-adaptive-cn", type=_str2bool, default=True, help="Use adaptive CN refit.")
     parser.add_argument("--history-json", default="", help="Optional path to save history JSON.")
+    parser.add_argument("--results-json", default="", help="Optional path to save batch results JSON.")
+    parser.add_argument("--save-checkpoints", type=_str2bool, default=True, help="Save checkpoints during runs.")
+    parser.add_argument("--save-checkpoint-data", type=_str2bool, default=True,
+                        help="Save full data in checkpoint (t_all/X_all/y_all).")
+    parser.add_argument("--verbose", type=_str2bool, default=False, help="Print per-seed history in batch mode.")
 
     args = parser.parse_args()
 
@@ -822,35 +873,92 @@ def main():
     beta_funcs = true_beta_funcs_default(scales=beta_scales)
 
     if args.checkpoint_dir:
-        checkpoint_dir = args.checkpoint_dir
+        base_dir = args.checkpoint_dir
     else:
         tag = args.tag.strip()
-        checkpoint_dir = f"checkpoints_vcm_{tag}" if tag else "checkpoints_vcm"
+        base_dir = f"checkpoints_vcm_{tag}" if tag else "checkpoints_vcm"
 
-    trainer, history = run_or_resume_incremental(
-        checkpoint_dir=checkpoint_dir,
-        t_final=float(args.t_final),
-        n_per_segment=int(args.n_per_segment),
-        P=int(args.P),
-        signal_idx=signal_idx,
-        beta_funcs=beta_funcs,
-        sigma=float(args.sigma),
-        k=int(args.k),
-        n_inner_per_unit=int(args.n_inner_per_unit),
-        seed_data=int(args.seed_data),
-        seed_cv=int(args.seed_cv),
-        use_1se=bool(args.use_1se),
-        r_relax=int(args.r_relax),
-        use_adaptive_cn=bool(args.use_adaptive_cn),
-    )
+    n_seeds = int(args.n_seeds)
+    if n_seeds <= 1:
+        checkpoint_dir = base_dir
+        trainer, history = run_or_resume_incremental(
+            checkpoint_dir=checkpoint_dir,
+            t_final=float(args.t_final),
+            n_per_segment=int(args.n_per_segment),
+            P=int(args.P),
+            signal_idx=signal_idx,
+            beta_funcs=beta_funcs,
+            sigma=float(args.sigma),
+            k=int(args.k),
+            n_inner_per_unit=int(args.n_inner_per_unit),
+            seed_data=int(args.seed_data),
+            seed_cv=int(args.seed_cv),
+            use_1se=bool(args.use_1se),
+            r_relax=int(args.r_relax),
+            use_adaptive_cn=bool(args.use_adaptive_cn),
+            save_checkpoints=bool(args.save_checkpoints),
+            save_checkpoint_data=bool(args.save_checkpoint_data),
+        )
 
-    print(f"checkpoint_dir={checkpoint_dir}")
-    for h in history:
-        print(h)
+        print(f"checkpoint_dir={checkpoint_dir}")
+        for h in history:
+            print(h)
 
-    if args.history_json:
-        with open(args.history_json, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
+        if args.history_json:
+            with open(args.history_json, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+    else:
+        seed_start = int(args.seed_data_start)
+        results = []
+        rmses = []
+        for i in range(n_seeds):
+            seed = seed_start + i
+            checkpoint_dir = f"{base_dir}_seed{seed}"
+
+            trainer, history = run_or_resume_incremental(
+                checkpoint_dir=checkpoint_dir,
+                t_final=float(args.t_final),
+                n_per_segment=int(args.n_per_segment),
+                P=int(args.P),
+                signal_idx=signal_idx,
+                beta_funcs=beta_funcs,
+                sigma=float(args.sigma),
+                k=int(args.k),
+                n_inner_per_unit=int(args.n_inner_per_unit),
+                seed_data=int(seed),
+                seed_cv=int(args.seed_cv),
+                use_1se=bool(args.use_1se),
+                r_relax=int(args.r_relax),
+                use_adaptive_cn=bool(args.use_adaptive_cn),
+                save_checkpoints=bool(args.save_checkpoints),
+                save_checkpoint_data=bool(args.save_checkpoint_data),
+            )
+
+            rmse, t_end = _extract_final_rmse(history)
+            if rmse is not None:
+                rmses.append(rmse)
+            results.append({
+                "seed_data": seed,
+                "t_end": t_end,
+                "train_rmse": rmse,
+                "checkpoint_dir": checkpoint_dir,
+            })
+
+            if args.verbose:
+                print(f"checkpoint_dir={checkpoint_dir}")
+                for h in history:
+                    print(h)
+
+        if rmses:
+            mean_rmse = float(np.mean(rmses))
+            std_rmse = float(np.std(rmses, ddof=1)) if len(rmses) > 1 else 0.0
+            print(f"seeds={n_seeds} mean_train_rmse={mean_rmse:.6g} std_train_rmse={std_rmse:.6g}")
+        else:
+            print("No train_rmse found in history.")
+
+        if args.results_json:
+            with open(args.results_json, "w", encoding="utf-8") as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":
