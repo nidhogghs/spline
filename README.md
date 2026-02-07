@@ -2,6 +2,115 @@
 
 本程序实现分阶段（每次扩展 1 个时间区间）的 VCM 训练，并支持检查点保存与断点续跑。
 
+## 推荐：main_1.py（配置文件驱动）
+
+`main_1.py` 已将实验配置与逻辑解耦，建议后续都用它跑本地与服务器任务。  
+你只需要改 JSON 配置文件，不需要改训练逻辑代码。
+
+### 1) 配置文件结构（最常用）
+
+示例：`configs/simple_t20.json`
+
+- `experiment`
+  - `tag`：实验名
+  - `checkpoint_root`：检查点根目录（默认 `checkpoints`）
+  - `checkpoint_dir`：本实验目录（可复用以断点续跑）
+  - `history_json`：历史输出 json 路径
+- `model`
+  - `P`：维度
+  - `k`、`knot_step`：样条参数
+  - `signal_idx`：有效变量索引
+  - `beta`：待拟合系数函数（可配置）
+- `data`
+  - `t_final`：终点区间
+  - `n_per_segment`：每段样本数
+  - `sigma`：噪声
+  - `seed_data`：数据种子
+- `train`
+  - `seed_cv`、`use_1se`、`save_checkpoint_data`、`debug`
+
+### 2) beta 函数配置格式
+
+`beta.specs` 是一个列表，每个元素对应一个有效变量函数，支持：
+
+- `type: "sin"` 或 `type: "cos"`：
+  - `amplitude`
+  - `frequency_pi`（表示 `frequency_pi * pi * t`）
+  - `phase`
+  - `bias`
+- `type: "trig_mix"`：
+  - `terms`: 多个 `{kind: sin/cos, amplitude, frequency_pi, phase}`
+  - `bias`
+
+### 3) 本地运行
+
+```bash
+conda run -n work python main_1.py --config configs/simple_t20.json
+```
+
+### 4) 服务器运行（推荐）
+
+```bash
+nohup conda run -n work python main_1.py --config configs/simple_t20.json \
+  > logs/simple_t20.log 2>&1 &
+```
+
+查看进度：
+
+```bash
+tail -f logs/simple_t20.log
+```
+
+### 5) 断点续跑 / 延长区间
+
+如果要从 `t_final=20` 续跑到 `40`：
+
+1. 复制一份配置文件，把 `data.t_final` 改成 `40`  
+2. 保持 `experiment.checkpoint_dir` 不变（指向同一实验目录）  
+3. 重新运行 `main_1.py --config ...`
+
+程序会自动加载已有最新 `ckpt_t*` 并继续跑。
+
+### 6) 仅加载最新 checkpoint 检查状态
+
+```bash
+conda run -n work python main_1.py --config configs/simple_t20.json --load-only true
+```
+
+> 说明：`main_1.py` 会额外打印 `rmse_by_stage` 与 `rmse_stage_diffs`，便于直接观察 RMSE 趋势。
+
+## main/main1/main2 三算法一键对比基准（服务器）
+
+已提供脚本：
+- `benchmark_compare_three.py`
+- 配置：`configs/benchmark_complex_t100_s30.json`
+- 一键启动：`run_benchmark_complex.sh`
+
+直接开跑（建议服务器）：
+
+```bash
+bash run_benchmark_complex.sh
+```
+
+默认会执行：
+- `main.py`
+- `main_1.py`
+- `main_2.py`（局部窗口 CN 更新）
+- 每个区间跑到 `t=100`
+- `30` 个种子
+- 输出汇总：`checkpoints/benchmark_complex_t100_s30/benchmark_summary.json`
+- 自动可视化输出：
+  - `checkpoints/benchmark_complex_t100_s30/rmse_compare_three.png`
+  - `checkpoints/benchmark_complex_t100_s30/coef_fit_main_90_100.png`
+  - `checkpoints/benchmark_complex_t100_s30/coef_fit_main1_90_100.png`
+  - `checkpoints/benchmark_complex_t100_s30/coef_fit_main2_90_100.png`
+
+你也可以直接用 Python 命令：
+
+```bash
+conda run -n work python benchmark_compare_three.py --config configs/benchmark_complex_t100_s30.json
+```
+
 ## 快速开始
 
 单次训练：

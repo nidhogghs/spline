@@ -1,0 +1,47 @@
+{
+  "experiment": {
+    "tag": "simple_t20_closefreq",
+    "checkpoint_root": "checkpoints",
+    "checkpoint_dir": "simple_t20_closefreq",
+    "history_json": "checkpoints/simple_t20_closefreq/history_t40.json"
+  },
+  "run": {
+    "load_only": false
+  },
+  "model": {
+    "P": 20,
+    "k": 3,
+    "knot_step": 0.1,
+    "signal_idx": [1, 7],
+    "beta": {
+      "specs": [
+        {
+          "type": "sin",
+          "amplitude": 1.0,
+          "frequency_pi": 2.0,
+          "phase": 0.0,
+          "bias": 0.0
+        },
+        {
+          "type": "sin",
+          "amplitude": 0.9,
+          "frequency_pi": 2.2,
+          "phase": 0.25,
+          "bias": 0.0
+        }
+      ]
+    }
+  },
+  "data": {
+    "t_final": 40,
+    "n_per_segment": 80,
+    "sigma": 0.15,
+    "seed_data": 0
+  },
+  "train": {
+    "seed_cv": 2025,
+    "use_1se": false,
+    "save_checkpoint_data": false,
+    "debug": false
+  }
+}

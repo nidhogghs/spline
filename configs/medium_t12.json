@@ -1,0 +1,30 @@
+{
+  "experiment": {
+    "tag": "medium_t12_default5",
+    "checkpoint_root": "checkpoints",
+    "checkpoint_dir": "medium_t12_default5",
+    "history_json": "checkpoints/medium_t12_default5/history_t12.json"
+  },
+  "run": {
+    "load_only": false
+  },
+  "model": {
+    "P": 50,
+    "k": 3,
+    "knot_step": 0.1,
+    "signal_idx": [1, 2, 3, 4, 5],
+    "beta_scales": [1, 1, 1, 1, 1]
+  },
+  "data": {
+    "t_final": 12,
+    "n_per_segment": 100,
+    "sigma": 0.2,
+    "seed_data": 0
+  },
+  "train": {
+    "seed_cv": 2025,
+    "use_1se": false,
+    "save_checkpoint_data": false,
+    "debug": false
+  }
+}
