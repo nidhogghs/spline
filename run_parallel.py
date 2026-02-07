@@ -5,6 +5,23 @@ import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
+DEFAULT_CHECKPOINT_ROOT = "checkpoints"
+
+
+def _resolve_checkpoint_base(checkpoint_dir):
+    ckpt_dir = str(checkpoint_dir).strip()
+    if not ckpt_dir:
+        return ckpt_dir
+    norm_dir = os.path.normpath(ckpt_dir)
+    if os.path.isabs(ckpt_dir):
+        return ckpt_dir
+    if norm_dir == DEFAULT_CHECKPOINT_ROOT:
+        return ckpt_dir
+    if norm_dir.startswith(DEFAULT_CHECKPOINT_ROOT + os.sep):
+        return ckpt_dir
+    return os.path.join(DEFAULT_CHECKPOINT_ROOT, ckpt_dir)
+
+
 def _str2bool(s):
     if isinstance(s, bool):
         return s
@@ -25,9 +42,10 @@ def _append_arg(cmd, name, value):
 
 def _build_checkpoint_dir(tag, checkpoint_dir, seed):
     if checkpoint_dir:
-        base = checkpoint_dir
+        base = _resolve_checkpoint_base(checkpoint_dir)
     else:
-        base = f"checkpoints_vcm_{tag}" if tag else "checkpoints_vcm"
+        default_name = f"checkpoints_vcm_{tag}" if tag else "checkpoints_vcm"
+        base = os.path.join(DEFAULT_CHECKPOINT_ROOT, default_name)
     return f"{base}_seed{seed}"
 
 

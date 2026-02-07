@@ -6,6 +6,22 @@ import numpy as np
 from numpy.linalg import norm
 from scipy.interpolate import BSpline
 
+DEFAULT_CHECKPOINT_ROOT = "checkpoints"
+
+
+def _resolve_checkpoint_base(checkpoint_dir):
+    ckpt_dir = str(checkpoint_dir).strip()
+    if not ckpt_dir:
+        return ckpt_dir
+    norm_dir = os.path.normpath(ckpt_dir)
+    if os.path.isabs(ckpt_dir):
+        return ckpt_dir
+    if norm_dir == DEFAULT_CHECKPOINT_ROOT:
+        return ckpt_dir
+    if norm_dir.startswith(DEFAULT_CHECKPOINT_ROOT + os.sep):
+        return ckpt_dir
+    return os.path.join(DEFAULT_CHECKPOINT_ROOT, ckpt_dir)
+
 
 # =========================================================
 # 0) True beta functions + Simulation generator
@@ -975,17 +991,19 @@ def main():
     beta_funcs = true_beta_funcs_default(scales=beta_scales)
 
     if args.checkpoint_dir:
-        base_dir = args.checkpoint_dir
+        base_dir = _resolve_checkpoint_base(args.checkpoint_dir)
     else:
         tag = args.tag.strip()
-        base_dir = f"checkpoints_vcm_{tag}" if tag else "checkpoints_vcm"
+        default_name = f"checkpoints_vcm_{tag}" if tag else "checkpoints_vcm"
+        base_dir = os.path.join(DEFAULT_CHECKPOINT_ROOT, default_name)
 
     if args.plot_interval:
         if args.checkpoint_dir:
-            checkpoint_dir = args.checkpoint_dir
+            checkpoint_dir = _resolve_checkpoint_base(args.checkpoint_dir)
         else:
             tag = args.tag.strip()
-            checkpoint_dir = f"checkpoints_vcm_{tag}" if tag else "checkpoints_vcm"
+            default_name = f"checkpoints_vcm_{tag}" if tag else "checkpoints_vcm"
+            checkpoint_dir = os.path.join(DEFAULT_CHECKPOINT_ROOT, default_name)
 
         if args.plot_ckpt > 0:
             ckpt_t = int(args.plot_ckpt)

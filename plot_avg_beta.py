@@ -8,6 +8,23 @@ import matplotlib.pyplot as plt
 from main import IncrementalVCMTrainer, true_beta_funcs_default
 
 
+DEFAULT_CHECKPOINT_ROOT = "checkpoints"
+
+
+def _resolve_checkpoint_base(checkpoint_dir):
+    ckpt_dir = str(checkpoint_dir).strip()
+    if not ckpt_dir:
+        return ckpt_dir
+    norm_dir = os.path.normpath(ckpt_dir)
+    if os.path.isabs(ckpt_dir):
+        return ckpt_dir
+    if norm_dir == DEFAULT_CHECKPOINT_ROOT:
+        return ckpt_dir
+    if norm_dir.startswith(DEFAULT_CHECKPOINT_ROOT + os.sep):
+        return ckpt_dir
+    return os.path.join(DEFAULT_CHECKPOINT_ROOT, ckpt_dir)
+
+
 def _parse_list_int(s: str) -> List[int]:
     return [int(x) for x in s.split(",") if x.strip() != ""]
 
@@ -18,9 +35,10 @@ def _parse_list_float(s: str) -> List[float]:
 
 def _build_checkpoint_dir(tag: str, checkpoint_dir: str, seed: int) -> str:
     if checkpoint_dir:
-        base = checkpoint_dir
+        base = _resolve_checkpoint_base(checkpoint_dir)
     else:
-        base = f"checkpoints_vcm_{tag}" if tag else "checkpoints_vcm"
+        default_name = f"checkpoints_vcm_{tag}" if tag else "checkpoints_vcm"
+        base = os.path.join(DEFAULT_CHECKPOINT_ROOT, default_name)
     return f"{base}_seed{seed}"
 
 
