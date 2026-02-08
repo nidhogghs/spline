@@ -20,9 +20,9 @@
           "phase": 0.0,
           "bias": -0.5,
           "log_tail": {
-            "start": 1.0,
-            "amplitude": 0.03,
-            "slope": 0.35,
+            "start": 0.8,
+            "amplitude": 0.08,
+            "slope": 0.9,
             "sign": -1.0
           }
         },
