@@ -2,7 +2,10 @@ import argparse
 import inspect
 import json
 import os
+import re
 import shutil
+import threading
+import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -24,6 +27,46 @@ def _extract_stage_rmse(history):
         if isinstance(h, dict) and ("stage" in h) and ("train_rmse" in h):
             out[int(h["stage"])] = float(h["train_rmse"])
     return out
+
+
+_CKPT_RE = re.compile(r"^ckpt_t(\d+)\.json$")
+
+
+def _start_ckpt_progress_watcher(seed, algo, ckpt_dir, stop_event, poll_sec=1.0):
+    def _watch():
+        seen = set()
+        while not stop_event.is_set():
+            if os.path.isdir(ckpt_dir):
+                try:
+                    names = os.listdir(ckpt_dir)
+                except Exception:
+                    names = []
+                stages = []
+                for name in names:
+                    m = _CKPT_RE.match(name)
+                    if m:
+                        stages.append(int(m.group(1)))
+                for st in sorted(stages):
+                    if st not in seen:
+                        seen.add(st)
+                        print(f"[progress] seed={seed} algo={algo} stage={st} (ckpt)", flush=True)
+            stop_event.wait(poll_sec)
+    t = threading.Thread(target=_watch, daemon=True)
+    t.start()
+    return t
+
+
+def _print_stage_history(seed, algo, history):
+    rows = []
+    for h in history:
+        if isinstance(h, dict) and ("stage" in h):
+            rows.append((int(h["stage"]), float(h.get("train_rmse", np.nan))))
+    rows.sort(key=lambda x: x[0])
+    for stg, rmse in rows:
+        if np.isfinite(rmse):
+            print(f"[progress] seed={seed} algo={algo} stage={stg} rmse={rmse:.6g}", flush=True)
+        else:
+            print(f"[progress] seed={seed} algo={algo} stage={stg}", flush=True)
 
 
 def _call_with_supported_kwargs(fn, **kwargs):
@@ -69,6 +112,8 @@ def _run_one_seed(seed, cfg):
             else:
                 print(f"[progress] seed={seed} algo={algo} stage={stg} rmse={float(rmse):.6g}", flush=True)
 
+        stop_old = threading.Event()
+        w_old = _start_ckpt_progress_watcher(seed, "main", old_dir, stop_old)
         _, h_old = _call_with_supported_kwargs(
             alg_old.run_or_resume_incremental,
             checkpoint_dir=old_dir,
@@ -89,8 +134,13 @@ def _run_one_seed(seed, cfg):
             save_checkpoint_data=bool(train.get("save_checkpoint_data", False)),
             progress_hook=lambda info: _progress("main", info),
         )
+        stop_old.set()
+        w_old.join(timeout=1.0)
+        _print_stage_history(seed, "main", h_old)
         print(f"[progress] seed={seed} algo=main done", flush=True)
 
+        stop_m1 = threading.Event()
+        w_m1 = _start_ckpt_progress_watcher(seed, "main1", m1_dir, stop_m1)
         _, h_m1 = _call_with_supported_kwargs(
             alg_m1.run_or_resume_incremental,
             checkpoint_dir=m1_dir,
@@ -109,8 +159,13 @@ def _run_one_seed(seed, cfg):
             debug=False,
             progress_hook=lambda info: _progress("main1", info),
         )
+        stop_m1.set()
+        w_m1.join(timeout=1.0)
+        _print_stage_history(seed, "main1", h_m1)
         print(f"[progress] seed={seed} algo=main1 done", flush=True)
 
+        stop_m2 = threading.Event()
+        w_m2 = _start_ckpt_progress_watcher(seed, "main2", m2_dir, stop_m2)
         _, h_m2 = _call_with_supported_kwargs(
             alg_m2.run_or_resume_incremental,
             checkpoint_dir=m2_dir,
@@ -131,6 +186,9 @@ def _run_one_seed(seed, cfg):
             local_support_margin=float(m2_cfg.get("local_support_margin", 0.0)),
             progress_hook=lambda info: _progress("main2", info),
         )
+        stop_m2.set()
+        w_m2.join(timeout=1.0)
+        _print_stage_history(seed, "main2", h_m2)
         print(f"[progress] seed={seed} algo=main2 done", flush=True)
 
         result["main_rmse"] = _extract_stage_rmse(h_old)
@@ -208,14 +266,10 @@ def main():
 
     results = []
     failures = []
-    with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        futs = {}
+    if max_workers == 1:
         for seed in seeds:
             print(f"[submit] seed={seed}")
-            futs[ex.submit(_run_one_seed, seed, cfg)] = seed
-        for fut in as_completed(futs):
-            seed = futs[fut]
-            r = fut.result()
+            r = _run_one_seed(seed, cfg)
             results.append(r)
             if r.get("ok", False):
                 print(
@@ -227,6 +281,26 @@ def main():
             else:
                 failures.append(seed)
                 print(f"[done] seed={seed} failed: {r.get('error')}")
+    else:
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            futs = {}
+            for seed in seeds:
+                print(f"[submit] seed={seed}")
+                futs[ex.submit(_run_one_seed, seed, cfg)] = seed
+            for fut in as_completed(futs):
+                seed = futs[fut]
+                r = fut.result()
+                results.append(r)
+                if r.get("ok", False):
+                    print(
+                        f"[done] seed={seed} ok "
+                        f"main={len(r.get('main_rmse', {}))} "
+                        f"main1={len(r.get('main1_rmse', {}))} "
+                        f"main2={len(r.get('main2_rmse', {}))}"
+                    )
+                else:
+                    failures.append(seed)
+                    print(f"[done] seed={seed} failed: {r.get('error')}")
 
     agg = _aggregate(results, cfg["data"]["t_final"])
     stats = {

@@ -1,0 +1,30 @@
+[benchmark3] run_root=checkpoints/benchmark_three_tiny_smoke
+[benchmark3] seeds=1 seed_start=0 max_workers=1
+[submit] seed=0
+[progress] seed=0 algo=main stage=1 rmse=0.0103867
+[progress] seed=0 algo=main stage=2 rmse=0.0635259
+[progress] seed=0 algo=main stage=3 rmse=0.0492907
+[progress] seed=0 algo=main stage=4 rmse=0.0431031
+[progress] seed=0 algo=main stage=5 rmse=0.0820074
+[progress] seed=0 algo=main done
+[progress] seed=0 algo=main1 stage=1 rmse=0.0143412
+[progress] seed=0 algo=main1 stage=2 rmse=0.0520333
+[progress] seed=0 algo=main1 stage=3 rmse=0.0427254
+[progress] seed=0 algo=main1 stage=4 rmse=0.0378886
+[progress] seed=0 algo=main1 stage=5 rmse=0.0881569
+[progress] seed=0 algo=main1 done
+[progress] seed=0 algo=main2 stage=1 rmse=0.0143412
+[progress] seed=0 algo=main2 stage=2 rmse=0.0520332
+[progress] seed=0 algo=main2 stage=3 rmse=0.0427253
+[progress] seed=0 algo=main2 stage=4 rmse=0.0378885
+[progress] seed=0 algo=main2 stage=5 rmse=0.0881568
+[progress] seed=0 algo=main2 done
+[done] seed=0 ok main=5 main1=5 main2=5
+[saved] checkpoints/benchmark_three_tiny_smoke/benchmark_summary.json
+[trend] main={'delta': 0.07162068722570339, 'increase_steps': 2, 'n_steps': 4, 'non_decreasing': False}
+[trend] main1={'delta': 0.07381573398483551, 'increase_steps': 2, 'n_steps': 4, 'non_decreasing': False}
+[trend] main2={'delta': 0.07381563619569251, 'increase_steps': 2, 'n_steps': 4, 'non_decreasing': False}
+[saved] checkpoints/benchmark_three_tiny_smoke/coef_fit_main_1_2.png
+[saved] checkpoints/benchmark_three_tiny_smoke/coef_fit_main1_1_2.png
+[saved] checkpoints/benchmark_three_tiny_smoke/coef_fit_main2_1_2.png
+[saved] checkpoints/benchmark_three_tiny_smoke/rmse_compare_three.png
