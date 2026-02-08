@@ -1,6 +1,7 @@
 {
   "experiment": {
     "run_root": "checkpoints/benchmark_complex_t100_s30",
+    "clean_seed_dir": true,
     "n_seeds": 1,
     "seed_start": 0,
     "max_workers": 1,

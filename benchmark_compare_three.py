@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import shutil
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -38,6 +39,12 @@ def _run_one_seed(seed, cfg):
     old_dir = os.path.join(run_root, "main", seed_name)
     m1_dir = os.path.join(run_root, "main1", seed_name)
     m2_dir = os.path.join(run_root, "main2", seed_name)
+
+    if bool(exp.get("clean_seed_dir", False)):
+        for d in (old_dir, m1_dir, m2_dir):
+            if os.path.isdir(d):
+                shutil.rmtree(d)
+
     os.makedirs(old_dir, exist_ok=True)
     os.makedirs(m1_dir, exist_ok=True)
     os.makedirs(m2_dir, exist_ok=True)
