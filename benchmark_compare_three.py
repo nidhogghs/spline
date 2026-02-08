@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 import os
 import shutil
@@ -23,6 +24,12 @@ def _extract_stage_rmse(history):
         if isinstance(h, dict) and ("stage" in h) and ("train_rmse" in h):
             out[int(h["stage"])] = float(h["train_rmse"])
     return out
+
+
+def _call_with_supported_kwargs(fn, **kwargs):
+    sig = inspect.signature(fn)
+    supported = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return fn(**supported)
 
 
 def _run_one_seed(seed, cfg):
@@ -62,7 +69,8 @@ def _run_one_seed(seed, cfg):
             else:
                 print(f"[progress] seed={seed} algo={algo} stage={stg} rmse={float(rmse):.6g}", flush=True)
 
-        _, h_old = alg_old.run_or_resume_incremental(
+        _, h_old = _call_with_supported_kwargs(
+            alg_old.run_or_resume_incremental,
             checkpoint_dir=old_dir,
             t_final=float(data["t_final"]),
             n_per_segment=int(data["n_per_segment"]),
@@ -83,7 +91,8 @@ def _run_one_seed(seed, cfg):
         )
         print(f"[progress] seed={seed} algo=main done", flush=True)
 
-        _, h_m1 = alg_m1.run_or_resume_incremental(
+        _, h_m1 = _call_with_supported_kwargs(
+            alg_m1.run_or_resume_incremental,
             checkpoint_dir=m1_dir,
             t_final=float(data["t_final"]),
             n_per_segment=int(data["n_per_segment"]),
@@ -102,7 +111,8 @@ def _run_one_seed(seed, cfg):
         )
         print(f"[progress] seed={seed} algo=main1 done", flush=True)
 
-        _, h_m2 = alg_m2.run_or_resume_incremental(
+        _, h_m2 = _call_with_supported_kwargs(
+            alg_m2.run_or_resume_incremental,
             checkpoint_dir=m2_dir,
             t_final=float(data["t_final"]),
             n_per_segment=int(data["n_per_segment"]),
