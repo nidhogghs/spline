@@ -54,6 +54,14 @@ def _run_one_seed(seed, cfg):
 
     result = {"seed": int(seed), "ok": False}
     try:
+        def _progress(algo, info):
+            stg = info.get("stage", info.get("t_end", "?"))
+            rmse = info.get("train_rmse", None)
+            if rmse is None:
+                print(f"[progress] seed={seed} algo={algo} stage={stg}", flush=True)
+            else:
+                print(f"[progress] seed={seed} algo={algo} stage={stg} rmse={float(rmse):.6g}", flush=True)
+
         _, h_old = alg_old.run_or_resume_incremental(
             checkpoint_dir=old_dir,
             t_final=float(data["t_final"]),
@@ -71,7 +79,9 @@ def _run_one_seed(seed, cfg):
             use_adaptive_cn=bool(old_cfg.get("use_adaptive_cn", True)),
             save_checkpoints=True,
             save_checkpoint_data=bool(train.get("save_checkpoint_data", False)),
+            progress_hook=lambda info: _progress("main", info),
         )
+        print(f"[progress] seed={seed} algo=main done", flush=True)
 
         _, h_m1 = alg_m1.run_or_resume_incremental(
             checkpoint_dir=m1_dir,
@@ -88,7 +98,9 @@ def _run_one_seed(seed, cfg):
             use_1se=bool(m1_cfg.get("use_1se", True)),
             save_checkpoint_data=bool(train.get("save_checkpoint_data", False)),
             debug=False,
+            progress_hook=lambda info: _progress("main1", info),
         )
+        print(f"[progress] seed={seed} algo=main1 done", flush=True)
 
         _, h_m2 = alg_m2.run_or_resume_incremental(
             checkpoint_dir=m2_dir,
@@ -107,7 +119,9 @@ def _run_one_seed(seed, cfg):
             debug=False,
             local_window_units=float(m2_cfg.get("local_window_units", 2.0)),
             local_support_margin=float(m2_cfg.get("local_support_margin", 0.0)),
+            progress_hook=lambda info: _progress("main2", info),
         )
+        print(f"[progress] seed={seed} algo=main2 done", flush=True)
 
         result["main_rmse"] = _extract_stage_rmse(h_old)
         result["main1_rmse"] = _extract_stage_rmse(h_m1)
@@ -160,9 +174,16 @@ def _trend_stats(curve):
 def main():
     parser = argparse.ArgumentParser(description="Benchmark main.py vs main_1.py vs main_2.py")
     parser.add_argument("--config", required=True)
+    parser.add_argument("--t-final", type=int, default=0, help="Override t_final from config when > 0")
+    parser.add_argument("--clean-seed-dir", type=int, default=-1,
+                        help="Override clean_seed_dir: 1=true, 0=false, -1=use config")
     args = parser.parse_args()
 
     cfg = _load_json(args.config)
+    if args.t_final and args.t_final > 0:
+        cfg["data"]["t_final"] = int(args.t_final)
+    if args.clean_seed_dir in (0, 1):
+        cfg["experiment"]["clean_seed_dir"] = bool(args.clean_seed_dir)
     exp = cfg["experiment"]
     run_root = exp["run_root"]
     os.makedirs(run_root, exist_ok=True)

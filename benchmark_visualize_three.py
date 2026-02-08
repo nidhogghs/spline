@@ -157,6 +157,12 @@ def main():
     signal_idx = [int(x) for x in model["signal_idx"]]
     beta_scales = [float(x) for x in model.get("beta_scales", [1, 1, 1, 1, 1])]
     t_final = int(data["t_final"])
+    if t_end > t_final:
+        t_end = float(t_final)
+    if t_start < 0:
+        t_start = 0.0
+    if t_start >= t_end:
+        t_start = max(0.0, t_end - 10.0)
 
     out_main = os.path.join(run_root, f"coef_fit_main_{int(t_start)}_{int(t_end)}.png")
     out_main1 = os.path.join(run_root, f"coef_fit_main1_{int(t_start)}_{int(t_end)}.png")
