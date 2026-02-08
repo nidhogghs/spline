@@ -21,6 +21,6 @@ fi
 echo "[python] $("$PYTHON_BIN" -V 2>&1)"
 
 echo "[start] $(date) log=$LOG_FILE"
-"$PYTHON_BIN" benchmark_compare_three.py --config configs/benchmark_complex_t100_s30.json | tee "$LOG_FILE"
-"$PYTHON_BIN" benchmark_visualize_three.py --config configs/benchmark_complex_t100_s30.json | tee -a "$LOG_FILE"
+"$PYTHON_BIN" benchmark_compare_three.py --config configs/benchmark_complex_t100_s30.json 2>&1 | tee "$LOG_FILE"
+"$PYTHON_BIN" benchmark_visualize_three.py --config configs/benchmark_complex_t100_s30.json 2>&1 | tee -a "$LOG_FILE"
 echo "[done] $(date)"
