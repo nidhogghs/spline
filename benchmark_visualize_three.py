@@ -22,6 +22,14 @@ def _load_json(path):
         return json.load(f)
 
 
+def _build_beta_funcs_from_model_cfg(model_cfg):
+    beta_cfg = model_cfg.get("beta", None)
+    if beta_cfg is not None:
+        return alg_main1.build_beta_functions_from_config(beta_cfg)
+    beta_scales = model_cfg.get("beta_scales", [1, 1, 1, 1, 1])
+    return alg_main.true_beta_funcs_default(scales=beta_scales)
+
+
 def _plot_rmse_compare(summary, out_path):
     agg = summary["aggregate"]
     stages = [int(s) for s in agg["stages"]]
@@ -122,7 +130,7 @@ def _plot_coef_interval_for_algo(
     t_start,
     t_end,
     signal_idx,
-    beta_scales,
+    beta_funcs,
     out_path,
 ):
     stage_used, prefixes = _collect_seed_checkpoints(summary, algo_name, run_root, ckpt_stage)
@@ -152,7 +160,7 @@ def _plot_coef_interval_for_algo(
     beta_mean = beta_arr.mean(axis=0)
     beta_std = beta_arr.std(axis=0, ddof=1) if beta_arr.shape[0] > 1 else np.zeros_like(beta_mean)
 
-    true_funcs = alg_main.true_beta_funcs_default(scales=beta_scales)
+    true_funcs = beta_funcs
 
     n_plots = len(signal_idx)
     cols = 2 if n_plots > 1 else 1
@@ -218,7 +226,7 @@ def main():
     t_start, t_end = ab
 
     signal_idx = [int(x) for x in model["signal_idx"]]
-    beta_scales = [float(x) for x in model.get("beta_scales", [1, 1, 1, 1, 1])]
+    beta_funcs = _build_beta_funcs_from_model_cfg(model)
     out_main = os.path.join(run_root, f"coef_fit_main_{int(t_start)}_{int(t_end)}.png")
     out_main1 = os.path.join(run_root, f"coef_fit_main1_{int(t_start)}_{int(t_end)}.png")
     out_main2 = os.path.join(run_root, f"coef_fit_main2_{int(t_start)}_{int(t_end)}.png")
@@ -237,7 +245,7 @@ def main():
                 t_start,
                 t_end,
                 signal_idx,
-                beta_scales,
+                beta_funcs,
                 outp,
             )
             print(f"[saved] {outp} (ckpt_t={used_stage}, interval=[{used_start},{used_end}])")

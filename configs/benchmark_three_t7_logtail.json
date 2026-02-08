@@ -1,0 +1,85 @@
+{
+  "experiment": {
+    "run_root": "checkpoints/benchmark_three_t7_logtail",
+    "clean_seed_dir": true,
+    "n_seeds": 1,
+    "seed_start": 0,
+    "max_workers": 1,
+    "out_json": "checkpoints/benchmark_three_t7_logtail/benchmark_summary.json"
+  },
+  "model": {
+    "P": 50,
+    "k": 3,
+    "signal_idx": [1, 2, 3, 4, 5],
+    "beta": {
+      "specs": [
+        {
+          "type": "cos",
+          "amplitude": 0.6,
+          "frequency_pi": 2.0,
+          "phase": 0.0,
+          "bias": -0.5,
+          "log_tail": {
+            "start": 1.0,
+            "amplitude": 0.03,
+            "slope": 0.35,
+            "sign": -1.0
+          }
+        },
+        {
+          "type": "cos",
+          "amplitude": 0.6,
+          "frequency_pi": 2.0,
+          "phase": 0.0,
+          "bias": -0.5
+        },
+        {
+          "type": "sin",
+          "amplitude": 0.7,
+          "frequency_pi": 4.0,
+          "phase": 0.0,
+          "bias": 0.0
+        },
+        {
+          "type": "sin",
+          "amplitude": 0.7,
+          "frequency_pi": 4.0,
+          "phase": 0.0,
+          "bias": 0.0
+        },
+        {
+          "type": "cos",
+          "amplitude": 0.4,
+          "frequency_pi": 3.0,
+          "phase": 0.0,
+          "bias": 0.0
+        }
+      ]
+    }
+  },
+  "data": {
+    "t_final": 7,
+    "n_per_segment": 400,
+    "sigma": 0.1
+  },
+  "train": {
+    "seed_cv": 2025,
+    "save_checkpoint_data": false
+  },
+  "old_algo": {
+    "n_inner_per_unit": 10,
+    "use_1se": false,
+    "r_relax": 2,
+    "use_adaptive_cn": false
+  },
+  "main1_algo": {
+    "knot_step": 0.1,
+    "use_1se": false
+  },
+  "main2_algo": {
+    "knot_step": 0.1,
+    "use_1se": false,
+    "local_window_units": 2.0,
+    "local_support_margin": 0.0
+  }
+}

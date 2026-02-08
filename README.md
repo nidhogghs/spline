@@ -124,6 +124,7 @@ benchmark 配置分 6 段：
 - `configs/benchmark_three_tiny_smoke.json`
 - `configs/benchmark_three_simple.json`
 - `configs/benchmark_complex_t100_s30.json`
+- `configs/benchmark_three_t7_logtail.json`（第 1 个系数叠加小幅 log 尾部下行）
 
 ## 6) 进度与排错
 

@@ -16,6 +16,14 @@ import main_1 as alg_m1
 import main_2 as alg_m2
 
 
+def _build_beta_funcs_from_model_cfg(model_cfg):
+    beta_cfg = model_cfg.get("beta", None)
+    if beta_cfg is not None:
+        return alg_m1.build_beta_functions_from_config(beta_cfg)
+    beta_scales = model_cfg.get("beta_scales", [1, 1, 1, 1, 1])
+    return alg_old.true_beta_funcs_default(scales=beta_scales)
+
+
 def _load_json(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -99,8 +107,7 @@ def _run_one_seed(seed, cfg):
     os.makedirs(m1_dir, exist_ok=True)
     os.makedirs(m2_dir, exist_ok=True)
 
-    beta_scales = model.get("beta_scales", [1, 1, 1, 1, 1])
-    beta_funcs = alg_old.true_beta_funcs_default(scales=beta_scales)
+    beta_funcs = _build_beta_funcs_from_model_cfg(model)
 
     result = {"seed": int(seed), "ok": False}
     try:

@@ -51,6 +51,19 @@ def _parse_float_list(v):
 
 
 def _build_single_beta_function(spec):
+    def _log_tail_term(t, tail_cfg):
+        if not isinstance(tail_cfg, dict):
+            return 0.0
+        start = float(tail_cfg.get("start", 0.0))
+        amp = float(tail_cfg.get("amplitude", 0.0))
+        slope = float(tail_cfg.get("slope", 1.0))
+        if slope <= 0:
+            slope = 1.0
+        sign = float(tail_cfg.get("sign", -1.0))
+        tt = np.asarray(t, dtype=float)
+        dt = np.maximum(tt - start, 0.0)
+        return sign * amp * np.log1p(slope * dt)
+
     kind = str(spec.get("type", "sin")).strip().lower()
 
     if kind in ("sin", "cos"):
@@ -58,15 +71,23 @@ def _build_single_beta_function(spec):
         freq_pi = float(spec.get("frequency_pi", spec.get("freq_pi", 2.0)))
         phase = float(spec.get("phase", 0.0))
         bias = float(spec.get("bias", 0.0))
+        tail_cfg = spec.get("log_tail", None)
         if kind == "sin":
-            return lambda t, a=amp, f=freq_pi, ph=phase, b=bias: b + a * np.sin(f * np.pi * t + ph)
-        return lambda t, a=amp, f=freq_pi, ph=phase, b=bias: b + a * np.cos(f * np.pi * t + ph)
+            return (
+                lambda t, a=amp, f=freq_pi, ph=phase, b=bias, tc=tail_cfg:
+                b + a * np.sin(f * np.pi * t + ph) + _log_tail_term(t, tc)
+            )
+        return (
+            lambda t, a=amp, f=freq_pi, ph=phase, b=bias, tc=tail_cfg:
+            b + a * np.cos(f * np.pi * t + ph) + _log_tail_term(t, tc)
+        )
 
     if kind == "trig_mix":
         terms = list(spec.get("terms", []))
         if not terms:
             raise ValueError("beta function spec type='trig_mix' requires non-empty 'terms'.")
         bias = float(spec.get("bias", 0.0))
+        tail_cfg = spec.get("log_tail", None)
 
         parsed = []
         for term in terms:
@@ -78,13 +99,14 @@ def _build_single_beta_function(spec):
             ph = float(term.get("phase", 0.0))
             parsed.append((tk, a, f, ph))
 
-        def _fn(t, b=bias, ps=parsed):
+        def _fn(t, b=bias, ps=parsed, tc=tail_cfg):
             out = np.zeros_like(np.asarray(t, dtype=float), dtype=float) + b
             for tk, a, f, ph in ps:
                 if tk == "sin":
                     out = out + a * np.sin(f * np.pi * t + ph)
                 else:
                     out = out + a * np.cos(f * np.pi * t + ph)
+            out = out + _log_tail_term(t, tc)
             return out
 
         return _fn
