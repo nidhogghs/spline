@@ -769,6 +769,7 @@ def run_or_resume_incremental(
     debug=False,
     local_window_units=2.0,
     local_support_margin=0.0,
+    progress_hook=None,
 ):
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -798,6 +799,8 @@ def run_or_resume_incremental(
         info = trainer.fit_stage1(t0, X0, y0)
         trainer.save_checkpoint(ckpt_path(1), save_data=save_checkpoint_data)
         history.append(info)
+        if callable(progress_hook):
+            progress_hook(dict(info))
     else:
         trainer = IncrementalVCMTrainer.load_checkpoint(ckpt_path(start_end), debug=debug)
         history.append({"loaded_from": ckpt_path(start_end), "t_end": trainer.t_end})
@@ -817,6 +820,8 @@ def run_or_resume_incremental(
         info = trainer.extend_one_stage(nxt, t_seg, X_seg, y_seg)
         trainer.save_checkpoint(ckpt_path(nxt), save_data=save_checkpoint_data)
         history.append(info)
+        if callable(progress_hook):
+            progress_hook(dict(info))
 
     return trainer, history
 

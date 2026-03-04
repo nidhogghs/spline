@@ -691,6 +691,7 @@ def run_or_resume_incremental(
     use_adaptive_cn=True,
     save_checkpoints=True,
     save_checkpoint_data=True,
+    progress_hook=None,
 ):
     """
     Stage-wise driver with checkpoint reuse:
@@ -765,6 +766,8 @@ def run_or_resume_incremental(
         if save_checkpoints:
             trainer.save_checkpoint(ckpt_path(next_end), save_data=save_checkpoint_data)
         history.append(info)
+        if callable(progress_hook):
+            progress_hook(dict(info))
         current_end = next_end
 
     return trainer, history

@@ -40,10 +40,23 @@ def _extract_stage_rmse(history):
 _CKPT_RE = re.compile(r"^ckpt_t(\d+)\.json$")
 
 
-def _start_ckpt_progress_watcher(seed, algo, ckpt_dir, stop_event, poll_sec=1.0):
+def _format_seconds(seconds):
+    s = max(0, int(round(float(seconds))))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{sec:02d}"
+    return f"{m:02d}:{sec:02d}"
+
+
+def _start_ckpt_progress_watcher(seed, algo, ckpt_dir, stop_event, total_stages=None, poll_sec=1.0, heartbeat_sec=90.0):
     def _watch():
         seen = set()
+        latest_stage = 0
+        last_heartbeat = time.time()
         while not stop_event.is_set():
+            now = time.time()
             if os.path.isdir(ckpt_dir):
                 try:
                     names = os.listdir(ckpt_dir)
@@ -55,9 +68,24 @@ def _start_ckpt_progress_watcher(seed, algo, ckpt_dir, stop_event, poll_sec=1.0)
                     if m:
                         stages.append(int(m.group(1)))
                 for st in sorted(stages):
+                    if st > latest_stage:
+                        latest_stage = st
                     if st not in seen:
                         seen.add(st)
-                        print(f"[progress] seed={seed} algo={algo} stage={st} (ckpt)", flush=True)
+                        if total_stages and total_stages > 0:
+                            pct = 100.0 * float(st) / float(total_stages)
+                            print(f"[progress] seed={seed} algo={algo} stage={st}/{total_stages} ({pct:.1f}%) (ckpt)", flush=True)
+                        else:
+                            print(f"[progress] seed={seed} algo={algo} stage={st} (ckpt)", flush=True)
+
+            if heartbeat_sec > 0 and (now - last_heartbeat) >= heartbeat_sec:
+                if total_stages and total_stages > 0:
+                    pct = 100.0 * float(latest_stage) / float(total_stages)
+                    print(f"[heartbeat] seed={seed} algo={algo} latest_stage={latest_stage}/{total_stages} ({pct:.1f}%)", flush=True)
+                else:
+                    print(f"[heartbeat] seed={seed} algo={algo} latest_stage={latest_stage}", flush=True)
+                last_heartbeat = now
+
             stop_event.wait(poll_sec)
     t = threading.Thread(target=_watch, daemon=True)
     t.start()
@@ -84,10 +112,12 @@ def _call_with_supported_kwargs(fn, **kwargs):
 
 
 def _run_one_seed(seed, cfg):
+    seed_started = time.time()
     exp = cfg["experiment"]
     data = cfg["data"]
     model = cfg["model"]
     train = cfg["train"]
+    total_stages = int(round(float(data.get("t_final", 0))))
     old_cfg = cfg.get("old_algo", {})
     m1_cfg = cfg.get("main1_algo", {})
     m2_cfg = cfg.get("main2_algo", {})
@@ -147,7 +177,7 @@ def _run_one_seed(seed, cfg):
         print(f"[progress] seed={seed} algo=main done", flush=True)
 
         stop_m1 = threading.Event()
-        w_m1 = _start_ckpt_progress_watcher(seed, "main1", m1_dir, stop_m1)
+        w_m1 = _start_ckpt_progress_watcher(seed, "main1", m1_dir, stop_m1, total_stages=total_stages)
         _, h_m1 = _call_with_supported_kwargs(
             alg_m1.run_or_resume_incremental,
             checkpoint_dir=m1_dir,
@@ -172,7 +202,7 @@ def _run_one_seed(seed, cfg):
         print(f"[progress] seed={seed} algo=main1 done", flush=True)
 
         stop_m2 = threading.Event()
-        w_m2 = _start_ckpt_progress_watcher(seed, "main2", m2_dir, stop_m2)
+        w_m2 = _start_ckpt_progress_watcher(seed, "main2", m2_dir, stop_m2, total_stages=total_stages)
         _, h_m2 = _call_with_supported_kwargs(
             alg_m2.run_or_resume_incremental,
             checkpoint_dir=m2_dir,
@@ -201,6 +231,7 @@ def _run_one_seed(seed, cfg):
         result["main_rmse"] = _extract_stage_rmse(h_old)
         result["main1_rmse"] = _extract_stage_rmse(h_m1)
         result["main2_rmse"] = _extract_stage_rmse(h_m2)
+        result["elapsed_sec"] = float(time.time() - seed_started)
         result["ok"] = True
         return result
     except Exception as e:
@@ -271,13 +302,32 @@ def main():
     print(f"[benchmark3] run_root={run_root}")
     print(f"[benchmark3] seeds={n_seeds} seed_start={seed_start} max_workers={max_workers}")
 
+    benchmark_started = time.time()
+    seed_durations = []
+
+    def _print_seed_progress(done_count):
+        elapsed = time.time() - benchmark_started
+        rate = (done_count / elapsed) if elapsed > 1e-9 else 0.0
+        remain = max(0, n_seeds - done_count)
+        eta = (remain / rate) if rate > 1e-9 else float("inf")
+        eta_text = _format_seconds(eta) if np.isfinite(eta) else "--:--"
+        avg_seed = (sum(seed_durations) / len(seed_durations)) if seed_durations else 0.0
+        pct = (100.0 * done_count / n_seeds) if n_seeds > 0 else 100.0
+        print(
+            f"[overall] seeds_done={done_count}/{n_seeds} ({pct:.1f}%) "
+            f"elapsed={_format_seconds(elapsed)} eta={eta_text} avg_seed={avg_seed:.1f}s"
+        )
+
     results = []
     failures = []
     if max_workers == 1:
+        done_count = 0
         for seed in seeds:
             print(f"[submit] seed={seed}")
             r = _run_one_seed(seed, cfg)
             results.append(r)
+            if r.get("elapsed_sec") is not None:
+                seed_durations.append(float(r.get("elapsed_sec", 0.0)))
             if r.get("ok", False):
                 print(
                     f"[done] seed={seed} ok "
@@ -288,7 +338,10 @@ def main():
             else:
                 failures.append(seed)
                 print(f"[done] seed={seed} failed: {r.get('error')}")
+            done_count += 1
+            _print_seed_progress(done_count)
     else:
+        done_count = 0
         with ProcessPoolExecutor(max_workers=max_workers) as ex:
             futs = {}
             for seed in seeds:
@@ -298,6 +351,8 @@ def main():
                 seed = futs[fut]
                 r = fut.result()
                 results.append(r)
+                if r.get("elapsed_sec") is not None:
+                    seed_durations.append(float(r.get("elapsed_sec", 0.0)))
                 if r.get("ok", False):
                     print(
                         f"[done] seed={seed} ok "
@@ -308,6 +363,8 @@ def main():
                 else:
                     failures.append(seed)
                     print(f"[done] seed={seed} failed: {r.get('error')}")
+                done_count += 1
+                _print_seed_progress(done_count)
 
     agg = _aggregate(results, cfg["data"]["t_final"])
     stats = {

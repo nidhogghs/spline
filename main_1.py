@@ -756,6 +756,7 @@ def run_or_resume_incremental(
     use_1se=True,
     save_checkpoint_data=True,
     debug=False,
+    progress_hook=None,
 ):
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -801,6 +802,8 @@ def run_or_resume_incremental(
         info = trainer.extend_one_stage(nxt, t_seg, X_seg, y_seg)
         trainer.save_checkpoint(ckpt_path(nxt), save_data=save_checkpoint_data)
         history.append(info)
+        if callable(progress_hook):
+            progress_hook(dict(info))
 
     return trainer, history
 
