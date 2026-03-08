@@ -1,0 +1,153 @@
+{
+  "global": {
+    "experiment": {
+      "n_seeds": 8,
+      "seed_start": 0,
+      "clean_seed_dir": false
+    },
+    "model": {
+      "P": 250,
+      "k": 3,
+      "signal_idx": [1, 2, 3, 4, 5],
+      "beta": {
+        "specs": [
+          {
+            "type": "trig_mix",
+            "bias": -0.15,
+            "terms": [
+              { "kind": "cos", "amplitude": 0.65, "frequency_pi": 2.0, "phase": 0.0 },
+              { "kind": "sin", "amplitude": 0.20, "frequency_pi": 4.0, "phase": 0.3 }
+            ]
+          },
+          {
+            "type": "trig_mix",
+            "bias": -0.10,
+            "terms": [
+              { "kind": "cos", "amplitude": 0.55, "frequency_pi": 2.2, "phase": 0.2 },
+              { "kind": "sin", "amplitude": 0.25, "frequency_pi": 3.6, "phase": 0.0 }
+            ]
+          },
+          {
+            "type": "trig_mix",
+            "bias": 0.0,
+            "terms": [
+              { "kind": "sin", "amplitude": 0.70, "frequency_pi": 4.0, "phase": 0.1 },
+              { "kind": "cos", "amplitude": 0.15, "frequency_pi": 1.0, "phase": 0.0 }
+            ]
+          },
+          {
+            "type": "trig_mix",
+            "bias": 0.0,
+            "terms": [
+              { "kind": "sin", "amplitude": 0.62, "frequency_pi": 4.4, "phase": 0.25 },
+              { "kind": "cos", "amplitude": 0.12, "frequency_pi": 1.2, "phase": 0.0 }
+            ]
+          },
+          {
+            "type": "trig_mix",
+            "bias": 0.0,
+            "terms": [
+              { "kind": "cos", "amplitude": 0.42, "frequency_pi": 3.0, "phase": 0.0 },
+              { "kind": "sin", "amplitude": 0.14, "frequency_pi": 5.0, "phase": 0.15 }
+            ]
+          }
+        ]
+      }
+    },
+    "data": {
+      "t_final": 20,
+      "n_per_segment": 160,
+      "sigma": 0.15
+    },
+    "train": {
+      "seed_cv": 2025,
+      "save_checkpoint_data": false
+    },
+    "old_algo": {
+      "n_inner_per_unit": 8,
+      "use_1se": false,
+      "r_relax": 2,
+      "use_adaptive_cn": true
+    },
+    "main1_algo": {
+      "knot_step": 0.1,
+      "use_1se": false
+    },
+    "main2_algo": {
+      "knot_step": 0.1,
+      "use_1se": false,
+      "local_window_units": 2.0,
+      "local_support_margin": 0.0
+    }
+  },
+  "scenarios": [
+    {
+      "name": "S1b_p250_t20_n180_sigma015_seed10",
+      "experiment": {
+        "n_seeds": 10
+      },
+      "model": {
+        "P": 250
+      },
+      "data": {
+        "t_final": 20,
+        "n_per_segment": 180,
+        "sigma": 0.15
+      }
+    },
+    {
+      "name": "S2b_p400_t24_n140_sigma015_seed8",
+      "experiment": {
+        "n_seeds": 8
+      },
+      "model": {
+        "P": 400
+      },
+      "data": {
+        "t_final": 24,
+        "n_per_segment": 140,
+        "sigma": 0.15
+      },
+      "resource": {
+        "max_workers_cap": 24,
+        "blas_threads": 1
+      }
+    },
+    {
+      "name": "S3b_p300_t32_n120_sigma020_seed6",
+      "experiment": {
+        "n_seeds": 6
+      },
+      "model": {
+        "P": 300
+      },
+      "data": {
+        "t_final": 32,
+        "n_per_segment": 120,
+        "sigma": 0.20
+      },
+      "resource": {
+        "max_workers_cap": 20,
+        "blas_threads": 1
+      }
+    },
+    {
+      "name": "S4b_p500_t28_n100_sigma022_seed6",
+      "experiment": {
+        "n_seeds": 6
+      },
+      "model": {
+        "P": 500
+      },
+      "data": {
+        "t_final": 28,
+        "n_per_segment": 100,
+        "sigma": 0.22
+      },
+      "resource": {
+        "max_workers_cap": 16,
+        "blas_threads": 1
+      }
+    }
+  ]
+}

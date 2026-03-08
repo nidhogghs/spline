@@ -1,3 +1,5 @@
 checkpoints/*
 venv/*
 EXPERIMENT_PLAN_LOCAL.md
+logs/reconstruction_records/*.json
+

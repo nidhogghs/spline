@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-SUITE_CONFIG="${SUITE_CONFIG:-configs/simulation_suite_paper_v1.json}"
+SUITE_CONFIG="${SUITE_CONFIG:-configs/simulation_suite_paper_v3_lowdim.json}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-checkpoints/paper_simulation_suite}"
 SCENARIOS="${SCENARIOS:-}"
 

@@ -567,8 +567,14 @@ class IncrementalVCMTrainer:
         arr = np.load(prefix_path + ".npz", allow_pickle=False)
         obj.knots = arr["knots"]
         coef_mat = arr["coef_mat"]
+        if int(coef_mat.shape[0]) != int(obj.P):
+            raise ValueError(
+                f"Checkpoint 系数维度不一致: meta.P={obj.P}, coef_mat_rows={coef_mat.shape[0]}。"
+                f"请清理该 checkpoint 目录后重跑。"
+            )
         obj.coef_blocks = [coef_mat[p].copy() for p in range(coef_mat.shape[0])]
         obj.t_end = float(meta["t_end"])
+
 
         if "t_all" in arr and "X_all" in arr and "y_all" in arr:
             obj.t_all = arr["t_all"]
@@ -779,12 +785,31 @@ def run_or_resume_incremental(
     history = []
     if start_end is None:
         trainer = IncrementalVCMTrainer(k=k, knot_step=knot_step, P=P, seed_cv=seed_cv, use_1se=use_1se, debug=debug)
+        print(f"[stage-start] stage=1/{int(round(t_final))} P={P} n={int(n_per_segment)}", flush=True)
         t0, X0, y0, _ = sim.sample_segment(0.0, 1.0, int(n_per_segment), segment_id=0)
         info = trainer.fit_stage1(t0, X0, y0)
         trainer.save_checkpoint(ckpt_path(1), save_data=save_checkpoint_data)
         history.append(info)
+        if callable(progress_hook):
+            progress_hook(dict(info))
+
     else:
         trainer = IncrementalVCMTrainer.load_checkpoint(ckpt_path(start_end), debug=debug)
+        if int(trainer.P) != int(P):
+            raise ValueError(
+                f"Checkpoint P={trainer.P} 与当前参数 P={P} 不一致。"
+                f"请使用新的 --checkpoint-dir，或先删除目录 {checkpoint_dir} 后重跑。"
+            )
+        if int(trainer.k) != int(k):
+            raise ValueError(
+                f"Checkpoint k={trainer.k} 与当前参数 k={k} 不一致。"
+                f"请使用新的 --checkpoint-dir，或先删除目录 {checkpoint_dir} 后重跑。"
+            )
+        if abs(float(trainer.knot_step) - float(knot_step)) > 1e-12:
+            raise ValueError(
+                f"Checkpoint knot_step={trainer.knot_step} 与当前参数 knot_step={knot_step} 不一致。"
+                f"请使用新的 --checkpoint-dir，或先删除目录 {checkpoint_dir} 后重跑。"
+            )
         history.append({"loaded_from": ckpt_path(start_end), "t_end": trainer.t_end})
 
     if trainer.t_all is None or trainer.X_all is None or trainer.y_all is None:
@@ -797,9 +822,11 @@ def run_or_resume_incremental(
         cur = float(trainer.t_end)
         nxt = cur + 1.0
         seg_id = int(round(cur))
+        print(f"[stage-start] stage={int(round(nxt))}/{int(round(t_final))} P={P} n={int(n_per_segment)}", flush=True)
 
         t_seg, X_seg, y_seg, _ = sim.sample_segment(cur, nxt, int(n_per_segment), segment_id=seg_id)
         info = trainer.extend_one_stage(nxt, t_seg, X_seg, y_seg)
+
         trainer.save_checkpoint(ckpt_path(nxt), save_data=save_checkpoint_data)
         history.append(info)
         if callable(progress_hook):
@@ -927,6 +954,25 @@ def main():
         print(f"num_basis={len(trainer.knots) - (trainer.k + 1)}")
         return
 
+    def _progress(info):
+        stg = info.get("stage", info.get("t_end", "?"))
+        rmse = info.get("train_rmse", None)
+        mse = info.get("train_mse", None)
+        if mse is None and rmse is not None:
+            try:
+                mse = float(rmse) ** 2
+            except Exception:
+                mse = None
+
+        if rmse is not None and mse is not None:
+            print(f"[progress] stage={stg} rmse={float(rmse):.6g} mse={float(mse):.6g}", flush=True)
+        elif rmse is not None:
+            print(f"[progress] stage={stg} rmse={float(rmse):.6g}", flush=True)
+        elif mse is not None:
+            print(f"[progress] stage={stg} mse={float(mse):.6g}", flush=True)
+        else:
+            print(f"[progress] stage={stg}", flush=True)
+
     trainer, history = run_or_resume_incremental(
         checkpoint_dir=checkpoint_dir,
         t_final=float(_get_cfg(cfg, "data", "t_final", args.t_final)),
@@ -942,6 +988,7 @@ def main():
         use_1se=bool(_get_cfg(cfg, "train", "use_1se", args.use_1se)),
         save_checkpoint_data=bool(_get_cfg(cfg, "train", "save_checkpoint_data", args.save_checkpoint_data)),
         debug=bool(_get_cfg(cfg, "train", "debug", args.debug)),
+        progress_hook=_progress,
     )
 
     print(f"checkpoint_dir={checkpoint_dir}")

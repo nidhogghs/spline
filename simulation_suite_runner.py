@@ -156,7 +156,22 @@ def _run_one_scenario(python_bin, project_root, name, cfg, env, dry_run=False):
         f.write(f"\n===== start {datetime.now().isoformat()} =====\n")
         f.write(f"cmd: {' '.join(cmd)}\n")
         f.flush()
-        proc = subprocess.run(cmd, cwd=project_root, env=env, stdout=f, stderr=subprocess.STDOUT, check=False)
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=project_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            f.write(line)
+            f.flush()
+            print(line, end="")
+        proc.wait()
 
     elapsed = time.time() - started
     return {
