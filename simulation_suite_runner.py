@@ -170,7 +170,7 @@ def _run_one_scenario(python_bin, project_root, name, cfg, env, dry_run=False):
         for line in proc.stdout:
             f.write(line)
             f.flush()
-            print(line, end="")
+            print(line, end="", flush=True)
         proc.wait()
 
     elapsed = time.time() - started
@@ -221,7 +221,7 @@ def main():
     os.makedirs(args.output_root, exist_ok=True)
 
     total_cpu = os.cpu_count() or 1
-    print(f"[suite] total_cpu={total_cpu} cpu_mode={args.cpu_mode}")
+    print(f"[suite] total_cpu={total_cpu} cpu_mode={args.cpu_mode}", flush=True)
 
     selected_scenarios = []
     for sc in scenarios:
@@ -254,7 +254,7 @@ def main():
         print(
             f"[scenario] ({idx}/{len(selected_scenarios)}) name={name} seeds={bench_cfg['experiment'].get('n_seeds')} "
             f"workers={workers} blas_threads={blas_threads} run_root={bench_cfg['experiment']['run_root']} eta={eta_text}"
-        )
+        , flush=True)
 
         result = _run_one_scenario(
             python_bin=args.python_bin,
@@ -270,18 +270,18 @@ def main():
 
         if not result["ok"]:
             failures.append(name)
-            print(f"[scenario] failed name={name} returncode={result['returncode']}")
+            print(f"[scenario] failed name={name} returncode={result['returncode']}", flush=True)
             if not bool(args.continue_on_error):
                 break
         else:
-            print(f"[scenario] done name={name} duration_sec={result['duration_sec']:.1f}")
+            print(f"[scenario] done name={name} duration_sec={result['duration_sec']:.1f}", flush=True)
 
         done_count = len(run_results)
         pct = (100.0 * done_count / len(selected_scenarios)) if selected_scenarios else 100.0
         print(
             f"[suite-progress] done={done_count}/{len(selected_scenarios)} ({pct:.1f}%) "
             f"elapsed={_format_seconds(time.time() - suite_started)}"
-        )
+        , flush=True)
 
     suite_summary = {
         "suite_config": os.path.abspath(args.suite_config),
@@ -303,7 +303,7 @@ def main():
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(suite_summary, f, ensure_ascii=False, indent=2)
 
-    print(f"[suite] summary_saved={summary_path}")
+    print(f"[suite] summary_saved={summary_path}", flush=True)
     if failures:
         raise SystemExit(f"Simulation suite finished with failures: {failures}")
 

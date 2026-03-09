@@ -31,7 +31,7 @@ echo "[suite] $SUITE_CONFIG" | tee -a "$LOG_FILE"
 echo "[output] $OUTPUT_ROOT" | tee -a "$LOG_FILE"
 echo "[resource] CPU_MODE=$CPU_MODE MAX_WORKERS=$MAX_WORKERS RESERVE_CPUS=$RESERVE_CPUS CPU_UTILIZATION=$CPU_UTILIZATION MAX_WORKERS_CAP=$MAX_WORKERS_CAP BLAS_THREADS=$BLAS_THREADS" | tee -a "$LOG_FILE"
 
-"$PYTHON_BIN" simulation_suite_runner.py \
+"$PYTHON_BIN" -u simulation_suite_runner.py \
   --suite-config "$SUITE_CONFIG" \
   --output-root "$OUTPUT_ROOT" \
   --python-bin "$PYTHON_BIN" \
