@@ -194,8 +194,8 @@ def main():
     parser.add_argument("--cpu-mode", choices=["auto", "manual"], default="auto",
                         help="auto=按预留核与利用率计算；manual=直接使用 --max-workers")
     parser.add_argument("--max-workers", type=int, default=0, help="manual 模式下并行 worker 数")
-    parser.add_argument("--reserve-cpus", type=int, default=24, help="auto 模式下预留给同学/系统的核数")
-    parser.add_argument("--cpu-utilization", type=float, default=0.7, help="auto 模式下可用核利用率")
+    parser.add_argument("--reserve-cpus", type=int, default=0, help="auto 模式下预留给同学/系统的核数")
+    parser.add_argument("--cpu-utilization", type=float, default=1.0, help="auto 模式下可用核利用率")
     parser.add_argument("--max-workers-cap", type=int, default=0, help="对最终 worker 数再做全局上限限制")
 
     parser.add_argument("--blas-threads", type=int, default=1,

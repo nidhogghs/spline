@@ -84,7 +84,7 @@
     {
       "name": "L1_p80_t4_n30_sigma020_seed2",
       "resource": {
-        "max_workers_cap": 2,
+        "max_workers_cap": 0,
         "blas_threads": 1
       }
     },
@@ -99,7 +99,7 @@
         "sigma": 0.20
       },
       "resource": {
-        "max_workers_cap": 2,
+        "max_workers_cap": 0,
         "blas_threads": 1
       }
     }

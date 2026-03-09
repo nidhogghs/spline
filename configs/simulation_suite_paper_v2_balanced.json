@@ -109,7 +109,7 @@
         "sigma": 0.15
       },
       "resource": {
-        "max_workers_cap": 24,
+        "max_workers_cap": 0,
         "blas_threads": 1
       }
     },
@@ -127,7 +127,7 @@
         "sigma": 0.20
       },
       "resource": {
-        "max_workers_cap": 20,
+        "max_workers_cap": 0,
         "blas_threads": 1
       }
     },
@@ -145,7 +145,7 @@
         "sigma": 0.22
       },
       "resource": {
-        "max_workers_cap": 16,
+        "max_workers_cap": 0,
         "blas_threads": 1
       }
     }
