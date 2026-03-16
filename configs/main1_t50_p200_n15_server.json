@@ -1,0 +1,67 @@
+{
+  "experiment": {
+    "checkpoint_root": "checkpoints",
+    "tag": "main1_t50_p200_n15_server"
+  },
+  "model": {
+    "P": 200,
+    "k": 3,
+    "signal_idx": [1, 2, 3, 4, 5],
+    "knot_step": 0.0625,
+    "beta": {
+      "specs": [
+        {
+          "type": "trig_mix",
+          "bias": -0.15,
+          "terms": [
+            { "kind": "cos", "amplitude": 0.65, "frequency_pi": 2.0, "phase": 0.0 },
+            { "kind": "sin", "amplitude": 0.20, "frequency_pi": 4.0, "phase": 0.3 }
+          ]
+        },
+        {
+          "type": "trig_mix",
+          "bias": -0.10,
+          "terms": [
+            { "kind": "cos", "amplitude": 0.55, "frequency_pi": 2.2, "phase": 0.2 },
+            { "kind": "sin", "amplitude": 0.25, "frequency_pi": 3.6, "phase": 0.0 }
+          ]
+        },
+        {
+          "type": "trig_mix",
+          "bias": 0.0,
+          "terms": [
+            { "kind": "sin", "amplitude": 0.70, "frequency_pi": 4.0, "phase": 0.1 },
+            { "kind": "cos", "amplitude": 0.15, "frequency_pi": 1.0, "phase": 0.0 }
+          ]
+        },
+        {
+          "type": "trig_mix",
+          "bias": 0.0,
+          "terms": [
+            { "kind": "sin", "amplitude": 0.62, "frequency_pi": 4.4, "phase": 0.25 },
+            { "kind": "cos", "amplitude": 0.12, "frequency_pi": 1.2, "phase": 0.0 }
+          ]
+        },
+        {
+          "type": "trig_mix",
+          "bias": 0.0,
+          "terms": [
+            { "kind": "cos", "amplitude": 0.42, "frequency_pi": 3.0, "phase": 0.0 },
+            { "kind": "sin", "amplitude": 0.14, "frequency_pi": 5.0, "phase": 0.15 }
+          ]
+        }
+      ]
+    }
+  },
+  "data": {
+    "t_final": 50,
+    "n_per_segment": 140,
+    "sigma": 0.18
+  },
+  "train": {
+    "seed_cv": 2025,
+    "use_1se": false,
+    "save_checkpoint_data": false,
+    "debug": false
+  }
+}

@@ -64,7 +64,7 @@
       "save_checkpoint_data": false
     },
     "old_algo": {
-      "n_inner_per_unit": 8,
+      "n_inner_per_unit": 15,
       "use_1se": false,
       "r_relax": 2,
       "use_adaptive_cn": true
