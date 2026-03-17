@@ -1,0 +1,67 @@
+{
+  "experiment": {
+    "checkpoint_root": "checkpoints",
+    "checkpoint_dir": "main1_t20_p100_n100_simple5_server",
+    "history_json": "checkpoints/main1_t20_p100_n100_simple5_server/history.json"
+  },
+  "model": {
+    "P": 100,
+    "k": 3,
+    "knot_step": 0.1,
+    "signal_idx": [1, 2, 3, 4, 5],
+    "beta": {
+      "specs": [
+        {
+          "type": "sin",
+          "amplitude": 0.60,
+          "frequency_pi": 0.50,
+          "phase": 0.00,
+          "bias": 0.00
+        },
+        {
+          "type": "cos",
+          "amplitude": 0.55,
+          "frequency_pi": 0.50,
+          "phase": 0.10,
+          "bias": 0.00
+        },
+        {
+          "type": "sin",
+          "amplitude": 0.50,
+          "frequency_pi": 0.75,
+          "phase": 0.20,
+          "bias": 0.00
+        },
+        {
+          "type": "cos",
+          "amplitude": 0.45,
+          "frequency_pi": 0.75,
+          "phase": 0.15,
+          "bias": 0.00
+        },
+        {
+          "type": "sin",
+          "amplitude": 0.40,
+          "frequency_pi": 1.00,
+          "phase": 0.30,
+          "bias": 0.00
+        }
+      ]
+    }
+  },
+  "data": {
+    "t_final": 20,
+    "n_per_segment": 100,
+    "sigma": 0.15,
+    "seed_data": 0
+  },
+  "train": {
+    "seed_cv": 2025,
+    "use_1se": false,
+    "save_checkpoint_data": false,
+    "debug": false
+  },
+  "run": {
+    "load_only": false
+  }
+}
