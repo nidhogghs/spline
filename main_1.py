@@ -237,11 +237,8 @@ def bspline_design_matrix(x, knots, k):
     x = np.asarray(x, dtype=float)
     t = np.asarray(knots, dtype=float)
     m = len(t) - (int(k) + 1)
-    B = np.zeros((x.shape[0], m), dtype=float)
-    for j in range(m):
-        c = np.zeros(m, dtype=float)
-        c[j] = 1.0
-        B[:, j] = BSpline(t, c, int(k), extrapolate=False)(x)
+    coeff = np.eye(m, dtype=float)
+    B = np.asarray(BSpline(t, coeff, int(k), extrapolate=False, axis=0)(x), dtype=float)
     B[np.isnan(B)] = 0.0
     return B
 
@@ -251,14 +248,59 @@ def build_vcm_design(B, X):
     X = np.asarray(X, dtype=float)
     n, m = B.shape
     P = X.shape[1]
-    Phi = np.zeros((n, m * P), dtype=float)
-    for p in range(P):
-        Phi[:, p * m:(p + 1) * m] = X[:, [p]] * B
-    return Phi
+    return (X[:, :, None] * B[:, None, :]).reshape(n, P * m)
 
 
 def split_blocks(vec, m, P):
     return [vec[p * m:(p + 1) * m] for p in range(P)]
+
+
+def _coef_to_block_matrix(vec, m, P):
+    return np.asarray(vec, dtype=float).reshape(int(P), int(m))
+
+
+def _predict_from_coef_matrix(B, X, coef_mat):
+    beta_hat = B @ np.asarray(coef_mat, dtype=float).T
+    return np.sum(np.asarray(X, dtype=float) * beta_hat, axis=1)
+
+
+def _lipschitz_from_gram(XtX):
+    XtX = np.asarray(XtX, dtype=float)
+    if XtX.size == 0:
+        return 1.0
+    try:
+        Ls = float(np.linalg.eigvalsh(XtX)[-1])
+    except np.linalg.LinAlgError:
+        Ls = float(np.linalg.norm(XtX, 2))
+    if (not np.isfinite(Ls)) or Ls <= 0:
+        return 1.0
+    return Ls
+
+
+def _apply_smooth_gram(B, X, coef_mat):
+    beta_hat = B @ coef_mat.T
+    pred = np.sum(X * beta_hat, axis=1)
+    return (X * pred[:, None]).T @ B
+
+
+def _estimate_lipschitz_design(B, X, max_iter=30, tol=1e-6):
+    P = X.shape[1]
+    m = B.shape[1]
+    v = np.ones((P, m), dtype=float)
+    v /= max(norm(v), 1e-12)
+    eig_prev = 0.0
+
+    for _ in range(int(max_iter)):
+        w = _apply_smooth_gram(B, X, v)
+        eig = float(norm(w))
+        if (not np.isfinite(eig)) or eig <= 0:
+            return 1.0
+        v = w / eig
+        if abs(eig - eig_prev) <= tol * max(1.0, eig):
+            break
+        eig_prev = eig
+
+    return max(1.0, eig * 1.02)
 
 
 def gram_R(knots, k, a, b, grid=3000):
@@ -287,48 +329,113 @@ def _safe_cholesky(R, jitter=1e-10):
     return np.linalg.cholesky(R + 1e-6 * eye)
 
 
-def lambda_max_R(Phi, y, m, R, w):
+def lambda_max_R(B, X, y, R, w):
+    B = np.asarray(B, dtype=float)
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m = B.shape[1]
     L = _safe_cholesky(R)
-    P = Phi.shape[1] // int(m)
-    lam = 0.0
-    for p in range(P):
-        g = Phi[:, p * m:(p + 1) * m].T @ y
-        u = np.linalg.solve(L.T, g)
-        lam = max(lam, float(norm(u) / max(float(w[p]), 1e-12)))
-    return lam
+    weighted_xy = X * y[:, None]
+    g = weighted_xy.T @ B
+    u = np.linalg.solve(L.T, g.T).T
+    denom = np.maximum(np.asarray(w, dtype=float), 1e-12)
+    return float(np.max(np.linalg.norm(u, axis=1) / denom))
 
 
 def group_soft_thresh(blocks, tau, R, lam, w):
-    out = []
-    for b, wp in zip(blocks, w):
-        nrm = float(np.sqrt(max(0.0, b.T @ R @ b)))
-        thr = float(tau * lam * wp)
-        if nrm <= thr:
-            out.append(np.zeros_like(b))
-        else:
-            out.append((1.0 - thr / nrm) * b)
-    return out
+    block_mat = np.asarray(blocks, dtype=float)
+    if block_mat.ndim == 1:
+        block_mat = block_mat[None, :]
+    quad = np.einsum("ij,ij->i", block_mat @ R, block_mat)
+    norms = np.sqrt(np.maximum(quad, 0.0))
+    thresh = float(tau * lam) * np.asarray(w, dtype=float)
+    scale = np.zeros_like(norms)
+    active = norms > thresh
+    scale[active] = 1.0 - thresh[active] / norms[active]
+    out = block_mat * scale[:, None]
+    return [out[i].copy() for i in range(out.shape[0])]
 
 
-def fista_group_lasso(XtX, Xty, lam, m, P, R, w, max_iter=6000, tol=1e-7):
+def fista_group_lasso(XtX, Xty, lam, m, P, R, w, max_iter=6000, tol=1e-7, Ls=None, init=None):
     m = int(m)
     P = int(P)
     d = m * P
 
-    Ls = float(np.linalg.norm(XtX, 2))
-    if (not np.isfinite(Ls)) or Ls <= 0:
-        Ls = 1.0
+    if Ls is None:
+        Ls = _lipschitz_from_gram(XtX)
+    else:
+        Ls = float(Ls)
+        if (not np.isfinite(Ls)) or Ls <= 0:
+            Ls = 1.0
     step = 1.0 / Ls
 
-    c = np.zeros(d, dtype=float)
+    if init is None:
+        c = np.zeros(d, dtype=float)
+    else:
+        c = np.asarray(init, dtype=float).reshape(d).copy()
     z = c.copy()
     tN = 1.0
+    w = np.asarray(w, dtype=float)
 
     for _ in range(int(max_iter)):
         grad = XtX @ z - Xty
-        yv = z - step * grad
-        y_blocks = split_blocks(yv, m, P)
-        c_new = np.concatenate(group_soft_thresh(y_blocks, step, R, lam, w))
+        yv_mat = _coef_to_block_matrix(z - step * grad, m, P)
+        quad = np.einsum("ij,ij->i", yv_mat @ R, yv_mat)
+        norms = np.sqrt(np.maximum(quad, 0.0))
+        thresh = step * float(lam) * w
+        scale = np.zeros_like(norms)
+        active = norms > thresh
+        scale[active] = 1.0 - thresh[active] / norms[active]
+        c_new = (yv_mat * scale[:, None]).reshape(d)
+
+        t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * tN * tN))
+        z = c_new + ((tN - 1.0) / t_new) * (c_new - c)
+
+        if norm(c_new - c) <= tol * max(1.0, norm(c)):
+            return c_new
+
+        c = c_new
+        tN = t_new
+
+    return c
+
+
+def fista_group_lasso_design(B, X, y, lam, R, w, max_iter=6000, tol=1e-7, Ls=None, init=None):
+    B = np.asarray(B, dtype=float)
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m = B.shape[1]
+    P = X.shape[1]
+    d = m * P
+
+    if Ls is None:
+        Ls = _estimate_lipschitz_design(B, X)
+    else:
+        Ls = float(Ls)
+        if (not np.isfinite(Ls)) or Ls <= 0:
+            Ls = 1.0
+    step = 1.0 / Ls
+
+    Xty_blocks = (X * y[:, None]).T @ B
+    if init is None:
+        c = np.zeros(d, dtype=float)
+    else:
+        c = np.asarray(init, dtype=float).reshape(d).copy()
+    z = c.copy()
+    tN = 1.0
+    w = np.asarray(w, dtype=float)
+
+    for _ in range(int(max_iter)):
+        z_mat = _coef_to_block_matrix(z, m, P)
+        grad_mat = _apply_smooth_gram(B, X, z_mat) - Xty_blocks
+        yv_mat = z_mat - step * grad_mat
+        quad = np.einsum("ij,ij->i", yv_mat @ R, yv_mat)
+        norms = np.sqrt(np.maximum(quad, 0.0))
+        thresh = step * float(lam) * w
+        scale = np.zeros_like(norms)
+        active = norms > thresh
+        scale[active] = 1.0 - thresh[active] / norms[active]
+        c_new = (yv_mat * scale[:, None]).reshape(d)
 
         t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * tN * tN))
         z = c_new + ((tN - 1.0) / t_new) * (c_new - c)
@@ -362,28 +469,36 @@ def cv_select_lambda_plain(B, X, y, R, lam_path, K=5, seed=2025, use_1se=True):
     m = B.shape[1]
     folds = kfold_indices(n, K=K, seed=seed)
     mse = np.zeros((len(lam_path), len(folds)), dtype=float)
+    all_idx = np.arange(n)
 
-    for li, lam in enumerate(lam_path):
-        for kf, val in enumerate(folds):
-            tr = np.setdiff1d(np.arange(n), val)
-            Btr, Bv = B[tr], B[val]
-            Xtr, Xv = X[tr], X[val]
-            ytr, yv = y[tr], y[val]
+    for kf, val in enumerate(folds):
+        tr_mask = np.ones(n, dtype=bool)
+        tr_mask[val] = False
+        tr = all_idx[tr_mask]
 
-            w_tr = group_weights(Btr, Xtr)
-            Phi_tr = build_vcm_design(Btr, Xtr)
-            Phi_v = build_vcm_design(Bv, Xv)
+        Btr, Bv = B[tr], B[val]
+        Xtr, Xv = X[tr], X[val]
+        ytr, yv = y[tr], y[val]
 
-            c = fista_group_lasso(
-                Phi_tr.T @ Phi_tr,
-                Phi_tr.T @ ytr,
+        w_tr = group_weights(Btr, Xtr)
+        Ls = _estimate_lipschitz_design(Btr, Xtr)
+        c_prev = np.zeros(m * P, dtype=float)
+
+        for li, lam in enumerate(lam_path):
+            c = fista_group_lasso_design(
+                Btr,
+                Xtr,
+                ytr,
                 float(lam),
-                m,
-                P,
                 R,
                 w_tr,
+                Ls=Ls,
+                init=c_prev,
             )
-            mse[li, kf] = float(np.mean((yv - Phi_v @ c) ** 2))
+            c_prev = c
+            mse[li, kf] = float(
+                np.mean((yv - _predict_from_coef_matrix(Bv, Xv, _coef_to_block_matrix(c, m, P))) ** 2)
+            )
 
     mm = mse.mean(axis=1)
     best = int(np.argmin(mm))
@@ -504,37 +619,42 @@ def cv_select_lambda_frozen(B_full, X, y, R_full, lam_path, idx_o, c_o_mat, K=5,
     R_cn = R_full[np.ix_(idx_cn, idx_cn)]
 
     mse = np.zeros((len(lam_path), len(folds)), dtype=float)
+    all_idx = np.arange(n_all)
+    m_cn = len(idx_cn)
 
-    for li, lam in enumerate(lam_path):
-        for kf, val in enumerate(folds):
-            tr = np.setdiff1d(np.arange(n_all), val)
+    for kf, val in enumerate(folds):
+        tr_mask = np.ones(n_all, dtype=bool)
+        tr_mask[val] = False
+        tr = all_idx[tr_mask]
 
-            Btr, Bv = B_full[tr], B_full[val]
-            Xtr, Xv = X[tr], X[val]
-            ytr, yv = y[tr], y[val]
+        Btr, Bv = B_full[tr], B_full[val]
+        Xtr, Xv = X[tr], X[val]
+        ytr, yv = y[tr], y[val]
 
-            Btr_o, Bv_o = Btr[:, idx_o], Bv[:, idx_o]
-            Btr_cn, Bv_cn = Btr[:, idx_cn], Bv[:, idx_cn]
+        Btr_o, Bv_o = Btr[:, idx_o], Bv[:, idx_o]
+        Btr_cn, Bv_cn = Btr[:, idx_cn], Bv[:, idx_cn]
 
-            frozen_tr = np.sum(Xtr * (Btr_o @ c_o_mat.T), axis=1)
-            frozen_v = np.sum(Xv * (Bv_o @ c_o_mat.T), axis=1)
+        frozen_tr = _predict_from_coef_matrix(Btr_o, Xtr, c_o_mat)
+        frozen_v = _predict_from_coef_matrix(Bv_o, Xv, c_o_mat)
 
-            ytr_res = ytr - frozen_tr
-            w_tr = group_weights(Btr_cn, Xtr)
+        ytr_res = ytr - frozen_tr
+        w_tr = group_weights(Btr_cn, Xtr)
+        Ls = _estimate_lipschitz_design(Btr_cn, Xtr)
+        c_prev = np.zeros(m_cn * P, dtype=float)
 
-            Phi_tr = build_vcm_design(Btr_cn, Xtr)
-            Phi_v = build_vcm_design(Bv_cn, Xv)
-
-            c_cn = fista_group_lasso(
-                Phi_tr.T @ Phi_tr,
-                Phi_tr.T @ ytr_res,
+        for li, lam in enumerate(lam_path):
+            c_cn = fista_group_lasso_design(
+                Btr_cn,
+                Xtr,
+                ytr_res,
                 float(lam),
-                Btr_cn.shape[1],
-                P,
                 R_cn,
                 w_tr,
+                Ls=Ls,
+                init=c_prev,
             )
-            y_pred = frozen_v + Phi_v @ c_cn
+            c_prev = c_cn
+            y_pred = frozen_v + _predict_from_coef_matrix(Bv_cn, Xv, _coef_to_block_matrix(c_cn, m_cn, P))
             mse[li, kf] = float(np.mean((yv - y_pred) ** 2))
 
     mm = mse.mean(axis=1)
@@ -647,11 +767,10 @@ class IncrementalVCMTrainer:
         B = bspline_design_matrix(self.t_all, self.knots, self.k)
         m = B.shape[1]
 
-        Phi = build_vcm_design(B, self.X_all)
         R = gram_R(self.knots, self.k, 0.0, 1.0)
         w_full = group_weights(B, self.X_all)
 
-        lam_max = lambda_max_R(Phi, self.y_all, m, R, w_full)
+        lam_max = lambda_max_R(B, self.X_all, self.y_all, R, w_full)
         lam_path = make_lambda_path(lam_max)
 
         lam_best = cv_select_lambda_plain(
@@ -665,10 +784,18 @@ class IncrementalVCMTrainer:
             use_1se=self.use_1se,
         )
 
-        c = fista_group_lasso(Phi.T @ Phi, Phi.T @ self.y_all, lam_best, m, self.P, R, w_full)
+        c = fista_group_lasso_design(
+            B,
+            self.X_all,
+            self.y_all,
+            lam_best,
+            R,
+            w_full,
+            Ls=_estimate_lipschitz_design(B, self.X_all),
+        )
         self.coef_blocks = split_blocks(c, m, self.P)
 
-        yhat = self.predict(self.t_all, self.X_all)
+        yhat = _predict_from_coef_matrix(B, self.X_all, np.stack(self.coef_blocks, axis=0))
         rmse = float(np.sqrt(np.mean((self.y_all - yhat) ** 2)))
 
         return {
@@ -717,10 +844,9 @@ class IncrementalVCMTrainer:
         R_full = gram_R(knots_new, self.k, 0.0, next_end)
         R_cn = R_full[np.ix_(idx_cn, idx_cn)]
 
-        Phi_cn = build_vcm_design(B_cn, self.X_all)
         w_cn = group_weights(B_cn, self.X_all)
 
-        lam_max = lambda_max_R(Phi_cn, y_res, B_cn.shape[1], R_cn, w_cn)
+        lam_max = lambda_max_R(B_cn, self.X_all, y_res, R_cn, w_cn)
         lam_path = make_lambda_path(lam_max)
 
         lam_best = cv_select_lambda_frozen(
@@ -736,14 +862,14 @@ class IncrementalVCMTrainer:
             use_1se=self.use_1se,
         )
 
-        c_cn = fista_group_lasso(
-            Phi_cn.T @ Phi_cn,
-            Phi_cn.T @ y_res,
+        c_cn = fista_group_lasso_design(
+            B_cn,
+            self.X_all,
+            y_res,
             lam_best,
-            B_cn.shape[1],
-            self.P,
             R_cn,
             w_cn,
+            Ls=_estimate_lipschitz_design(B_cn, self.X_all),
         )
 
         blocks_cn = split_blocks(c_cn, B_cn.shape[1], self.P)
@@ -758,7 +884,7 @@ class IncrementalVCMTrainer:
         self.knots = knots_new
         self.coef_blocks = coef_new
 
-        yhat = self.predict(self.t_all, self.X_all)
+        yhat = _predict_from_coef_matrix(B_full, self.X_all, np.stack(self.coef_blocks, axis=0))
         rmse = float(np.sqrt(np.mean((self.y_all - yhat) ** 2)))
 
         return {
