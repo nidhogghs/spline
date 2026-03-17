@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import threading
+import time
 
 import numpy as np
 from numpy.linalg import norm
@@ -24,6 +26,54 @@ def _parse_list_int(s):
 
 def _parse_list_float(s):
     return [float(x) for x in str(s).split(",") if x.strip()]
+
+
+def _format_seconds(seconds):
+    s = max(0, int(round(float(seconds))))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{sec:02d}"
+    return f"{m:02d}:{sec:02d}"
+
+
+def _start_heartbeat_watcher(algo_name, stage_getter, total_stages, stop_event, interval_sec=90.0, start_time=None):
+    interval = float(interval_sec)
+    if interval <= 0:
+        return None
+
+    run_start = float(start_time) if start_time is not None else time.time()
+
+    def _watch():
+        while not stop_event.wait(interval):
+            now = time.time()
+            try:
+                cur_stage = int(round(float(stage_getter())))
+            except Exception:
+                cur_stage = 0
+            cur_stage = max(0, cur_stage)
+            elapsed = max(0.0, now - run_start)
+            avg_stage = (elapsed / float(cur_stage)) if cur_stage > 0 else None
+            avg_stage_text = f"{avg_stage:.1f}s" if avg_stage is not None else "NA"
+
+            if total_stages and total_stages > 0:
+                pct = 100.0 * float(cur_stage) / float(total_stages)
+                print(
+                    f"[heartbeat] algo={algo_name} latest_stage={cur_stage}/{int(total_stages)} ({pct:.1f}%) "
+                    f"elapsed={_format_seconds(elapsed)} avg_stage={avg_stage_text}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[heartbeat] algo={algo_name} latest_stage={cur_stage} "
+                    f"elapsed={_format_seconds(elapsed)} avg_stage={avg_stage_text}",
+                    flush=True,
+                )
+
+    t = threading.Thread(target=_watch, daemon=True)
+    t.start()
+    return t
 
 
 def true_beta_funcs_default(scales=None):
@@ -769,6 +819,7 @@ def run_or_resume_incremental(
     debug=False,
     local_window_units=2.0,
     local_support_margin=0.0,
+    heartbeat_sec=90.0,
     progress_hook=None,
 ):
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -790,19 +841,42 @@ def run_or_resume_incremental(
     sim = VCMSimulator(P=P, signal_idx=signal_idx, beta_funcs=beta_funcs, sigma=sigma, seed_base=seed_data)
 
     history = []
+    run_started = time.time()
+    total_stages = int(round(t_final))
+    hb_stop = threading.Event()
+    hb_thread = None
     if start_end is None:
         trainer = IncrementalVCMTrainer(
             k=k, knot_step=knot_step, P=P, seed_cv=seed_cv, use_1se=use_1se, debug=debug,
             local_window_units=local_window_units, local_support_margin=local_support_margin
         )
+        hb_thread = _start_heartbeat_watcher(
+            "main2",
+            stage_getter=lambda: trainer.t_end or 0.0,
+            total_stages=total_stages,
+            stop_event=hb_stop,
+            interval_sec=heartbeat_sec,
+            start_time=run_started,
+        )
+        print(f"[stage-start] stage=1/{int(round(t_final))} P={P} n={int(n_per_segment)}", flush=True)
+        stage_started = time.time()
         t0, X0, y0, _ = sim.sample_segment(0.0, 1.0, int(n_per_segment), segment_id=0)
         info = trainer.fit_stage1(t0, X0, y0)
         trainer.save_checkpoint(ckpt_path(1), save_data=save_checkpoint_data)
+        info["elapsed_sec"] = float(time.time() - stage_started)
         history.append(info)
         if callable(progress_hook):
             progress_hook(dict(info))
     else:
         trainer = IncrementalVCMTrainer.load_checkpoint(ckpt_path(start_end), debug=debug)
+        hb_thread = _start_heartbeat_watcher(
+            "main2",
+            stage_getter=lambda: trainer.t_end or 0.0,
+            total_stages=total_stages,
+            stop_event=hb_stop,
+            interval_sec=heartbeat_sec,
+            start_time=run_started,
+        )
         history.append({"loaded_from": ckpt_path(start_end), "t_end": trainer.t_end})
 
     if trainer.t_all is None or trainer.X_all is None or trainer.y_all is None:
@@ -815,13 +889,20 @@ def run_or_resume_incremental(
         cur = float(trainer.t_end)
         nxt = cur + 1.0
         seg_id = int(round(cur))
+        print(f"[stage-start] stage={int(round(nxt))}/{int(round(t_final))} P={P} n={int(n_per_segment)}", flush=True)
 
+        stage_started = time.time()
         t_seg, X_seg, y_seg, _ = sim.sample_segment(cur, nxt, int(n_per_segment), segment_id=seg_id)
         info = trainer.extend_one_stage(nxt, t_seg, X_seg, y_seg)
         trainer.save_checkpoint(ckpt_path(nxt), save_data=save_checkpoint_data)
+        info["elapsed_sec"] = float(time.time() - stage_started)
         history.append(info)
         if callable(progress_hook):
             progress_hook(dict(info))
+
+    hb_stop.set()
+    if hb_thread is not None:
+        hb_thread.join(timeout=1.0)
 
     return trainer, history
 
@@ -858,6 +939,28 @@ def _summarize_rmse_history(history):
         return stage_rmse, []
     diffs = [stage_rmse[i][1] - stage_rmse[i - 1][1] for i in range(1, len(stage_rmse))]
     return stage_rmse, diffs
+
+
+def _summarize_timing_history(history):
+    rows = []
+    for h in history:
+        if isinstance(h, dict) and ("stage" in h) and ("elapsed_sec" in h):
+            try:
+                rows.append((int(h["stage"]), float(h["elapsed_sec"])))
+            except Exception:
+                pass
+    rows.sort(key=lambda x: x[0])
+    if not rows:
+        return None
+    vals = [x[1] for x in rows]
+    return {
+        "num_stages": int(len(vals)),
+        "total_elapsed_sec": float(sum(vals)),
+        "mean_stage_sec": float(np.mean(vals)),
+        "max_stage_sec": float(np.max(vals)),
+        "min_stage_sec": float(np.min(vals)),
+        "stage_elapsed_sec": {int(s): float(v) for s, v in rows},
+    }
 
 
 def _find_latest_checkpoint(checkpoint_dir):
@@ -903,6 +1006,7 @@ def main():
     parser.add_argument("--save-checkpoint-data", type=_str2bool, default=True)
     parser.add_argument("--history-json", default="")
     parser.add_argument("--debug", type=_str2bool, default=False)
+    parser.add_argument("--heartbeat-sec", type=float, default=90.0, help="Heartbeat interval in seconds; <=0 disables.")
 
     parser.add_argument("--load-only", type=_str2bool, default=False,
                         help="Only load latest checkpoint and print basic info.")
@@ -964,6 +1068,7 @@ def main():
         debug=bool(_get_cfg(cfg, "train", "debug", args.debug)),
         local_window_units=float(_get_cfg(cfg, "train", "local_window_units", args.local_window_units)),
         local_support_margin=float(_get_cfg(cfg, "train", "local_support_margin", args.local_support_margin)),
+        heartbeat_sec=float(_get_cfg(cfg, "train", "heartbeat_sec", args.heartbeat_sec)),
     )
 
     print(f"checkpoint_dir={checkpoint_dir}")
@@ -975,6 +1080,16 @@ def main():
         print("rmse_by_stage=", {s: r for s, r in stage_rmse})
     if diffs:
         print("rmse_stage_diffs=", diffs)
+
+    timing_stats = _summarize_timing_history(history)
+    if timing_stats is not None:
+        print("timing_summary=", {
+            "num_stages": timing_stats["num_stages"],
+            "total_elapsed_sec": timing_stats["total_elapsed_sec"],
+            "mean_stage_sec": timing_stats["mean_stage_sec"],
+            "max_stage_sec": timing_stats["max_stage_sec"],
+            "min_stage_sec": timing_stats["min_stage_sec"],
+        })
 
     history_json = _get_cfg(cfg, "experiment", "history_json", args.history_json)
     if history_json:

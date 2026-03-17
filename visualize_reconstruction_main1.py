@@ -8,7 +8,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from main_1 import IncrementalVCMTrainer, bspline_design_matrix, true_beta_funcs_default
+from main_1 import (
+    IncrementalVCMTrainer,
+    bspline_design_matrix,
+    build_beta_functions_from_config,
+    true_beta_funcs_default,
+)
 
 
 
@@ -38,15 +43,24 @@ def _find_latest_checkpoint(checkpoint_dir: str):
     return best
 
 
+def _load_json(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Visualize main_1 reconstruction and save metrics record.")
+    parser.add_argument("--config", default="", help="Optional training config JSON used to recover signal_idx/beta.")
     parser.add_argument("--checkpoint-dir", required=True)
-    parser.add_argument("--signal-idx", default="1,2,3,4,5")
-    parser.add_argument("--beta-scales", default="1,1,1,1,1")
+    parser.add_argument("--signal-idx", default="", help="Optional override, e.g. 1,2,3")
+    parser.add_argument("--beta-scales", default="", help="Optional override for default beta family.")
     parser.add_argument("--grid", type=int, default=400)
     parser.add_argument("--out-png", required=True)
     parser.add_argument("--out-record", required=True)
     args = parser.parse_args()
+
+    cfg = _load_json(args.config) if args.config else {}
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
 
     ckpt_dir = os.path.normpath(args.checkpoint_dir)
     t_latest = _find_latest_checkpoint(ckpt_dir)
@@ -57,9 +71,20 @@ def main():
     B = bspline_design_matrix(t_grid, trainer.knots, trainer.k)
     beta_hat = np.column_stack([B @ trainer.coef_blocks[p] for p in range(trainer.P)])
 
+    if args.signal_idx:
+        signal_idx = _parse_int_list(args.signal_idx)
+    else:
+        signal_idx = list(model_cfg.get("signal_idx", [1, 2, 3, 4, 5]))
 
-    signal_idx = _parse_int_list(args.signal_idx)
-    beta_funcs = true_beta_funcs_default(_parse_float_list(args.beta_scales))
+    if "beta" in model_cfg:
+        beta_funcs = build_beta_functions_from_config(model_cfg.get("beta"))
+    elif "beta_scales" in model_cfg:
+        beta_funcs = true_beta_funcs_default(_parse_float_list(model_cfg.get("beta_scales", [])))
+    else:
+        beta_funcs = true_beta_funcs_default()
+
+    if args.beta_scales:
+        beta_funcs = true_beta_funcs_default(_parse_float_list(args.beta_scales))
 
     os.makedirs(os.path.dirname(args.out_png) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(args.out_record) or ".", exist_ok=True)
@@ -101,6 +126,7 @@ def main():
         "k": int(trainer.k),
         "knot_step": float(trainer.knot_step),
         "signal_idx": signal_idx,
+        "config_path": (os.path.normpath(args.config) if args.config else ""),
         "per_signal_beta_rmse": per_signal_rmse,
         "mean_signal_beta_rmse": float(np.mean(list(per_signal_rmse.values()))),
         "plot_path": os.path.normpath(args.out_png),

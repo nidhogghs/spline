@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import inspect
 import json
 import os
@@ -50,11 +50,14 @@ def _format_seconds(seconds):
     return f"{m:02d}:{sec:02d}"
 
 
-def _start_ckpt_progress_watcher(seed, algo, ckpt_dir, stop_event, total_stages=None, poll_sec=1.0, heartbeat_sec=90.0):
+def _start_ckpt_progress_watcher(
+    seed, algo, ckpt_dir, stop_event, total_stages=None, poll_sec=1.0, heartbeat_sec=90.0, start_time=None
+):
     def _watch():
         seen = set()
         latest_stage = 0
         last_heartbeat = time.time()
+        watch_start = float(start_time) if start_time is not None else time.time()
         while not stop_event.is_set():
             now = time.time()
             if os.path.isdir(ckpt_dir):
@@ -79,11 +82,23 @@ def _start_ckpt_progress_watcher(seed, algo, ckpt_dir, stop_event, total_stages=
                             print(f"[progress] seed={seed} algo={algo} stage={st} (ckpt)", flush=True)
 
             if heartbeat_sec > 0 and (now - last_heartbeat) >= heartbeat_sec:
+                elapsed = max(0.0, now - watch_start)
+                elapsed_text = _format_seconds(elapsed)
+                avg_stage_sec = (elapsed / float(latest_stage)) if latest_stage > 0 else None
+                avg_stage_text = f"{avg_stage_sec:.1f}s" if avg_stage_sec is not None else "NA"
                 if total_stages and total_stages > 0:
                     pct = 100.0 * float(latest_stage) / float(total_stages)
-                    print(f"[heartbeat] seed={seed} algo={algo} latest_stage={latest_stage}/{total_stages} ({pct:.1f}%)", flush=True)
+                    print(
+                        f"[heartbeat] seed={seed} algo={algo} latest_stage={latest_stage}/{total_stages} ({pct:.1f}%) "
+                        f"elapsed={elapsed_text} avg_stage={avg_stage_text}",
+                        flush=True,
+                    )
                 else:
-                    print(f"[heartbeat] seed={seed} algo={algo} latest_stage={latest_stage}", flush=True)
+                    print(
+                        f"[heartbeat] seed={seed} algo={algo} latest_stage={latest_stage} "
+                        f"elapsed={elapsed_text} avg_stage={avg_stage_text}",
+                        flush=True,
+                    )
                 last_heartbeat = now
 
             stop_event.wait(poll_sec)
@@ -149,8 +164,11 @@ def _run_one_seed(seed, cfg):
             else:
                 print(f"[progress] seed={seed} algo={algo} stage={stg} rmse={float(rmse):.6g}", flush=True)
 
+        main_started = time.time()
         stop_old = threading.Event()
-        w_old = _start_ckpt_progress_watcher(seed, "main", old_dir, stop_old)
+        w_old = _start_ckpt_progress_watcher(
+            seed, "main", old_dir, stop_old, total_stages=total_stages, start_time=main_started
+        )
         _, h_old = _call_with_supported_kwargs(
             alg_old.run_or_resume_incremental,
             checkpoint_dir=old_dir,
@@ -173,11 +191,15 @@ def _run_one_seed(seed, cfg):
         )
         stop_old.set()
         w_old.join(timeout=1.0)
+        main_elapsed = float(time.time() - main_started)
         _print_stage_history(seed, "main", h_old)
-        print(f"[progress] seed={seed} algo=main done", flush=True)
+        print(f"[progress] seed={seed} algo=main done elapsed={main_elapsed:.1f}s", flush=True)
 
+        main1_started = time.time()
         stop_m1 = threading.Event()
-        w_m1 = _start_ckpt_progress_watcher(seed, "main1", m1_dir, stop_m1, total_stages=total_stages)
+        w_m1 = _start_ckpt_progress_watcher(
+            seed, "main1", m1_dir, stop_m1, total_stages=total_stages, start_time=main1_started
+        )
         _, h_m1 = _call_with_supported_kwargs(
             alg_m1.run_or_resume_incremental,
             checkpoint_dir=m1_dir,
@@ -198,11 +220,15 @@ def _run_one_seed(seed, cfg):
         )
         stop_m1.set()
         w_m1.join(timeout=1.0)
+        main1_elapsed = float(time.time() - main1_started)
         _print_stage_history(seed, "main1", h_m1)
-        print(f"[progress] seed={seed} algo=main1 done", flush=True)
+        print(f"[progress] seed={seed} algo=main1 done elapsed={main1_elapsed:.1f}s", flush=True)
 
+        main2_started = time.time()
         stop_m2 = threading.Event()
-        w_m2 = _start_ckpt_progress_watcher(seed, "main2", m2_dir, stop_m2, total_stages=total_stages)
+        w_m2 = _start_ckpt_progress_watcher(
+            seed, "main2", m2_dir, stop_m2, total_stages=total_stages, start_time=main2_started
+        )
         _, h_m2 = _call_with_supported_kwargs(
             alg_m2.run_or_resume_incremental,
             checkpoint_dir=m2_dir,
@@ -225,12 +251,16 @@ def _run_one_seed(seed, cfg):
         )
         stop_m2.set()
         w_m2.join(timeout=1.0)
+        main2_elapsed = float(time.time() - main2_started)
         _print_stage_history(seed, "main2", h_m2)
-        print(f"[progress] seed={seed} algo=main2 done", flush=True)
+        print(f"[progress] seed={seed} algo=main2 done elapsed={main2_elapsed:.1f}s", flush=True)
 
         result["main_rmse"] = _extract_stage_rmse(h_old)
         result["main1_rmse"] = _extract_stage_rmse(h_m1)
         result["main2_rmse"] = _extract_stage_rmse(h_m2)
+        result["main_elapsed_sec"] = main_elapsed
+        result["main1_elapsed_sec"] = main1_elapsed
+        result["main2_elapsed_sec"] = main2_elapsed
         result["elapsed_sec"] = float(time.time() - seed_started)
         result["ok"] = True
         return result
@@ -275,6 +305,26 @@ def _trend_stats(curve):
         "n_steps": int(len(diffs)),
         "non_decreasing": bool(all(d >= -1e-12 for d in diffs)),
     }
+
+
+def _timing_stats(seed_results, t_final):
+    out = {}
+    for algo in ("main", "main1", "main2"):
+        key = f"{algo}_elapsed_sec"
+        vals = [float(r[key]) for r in seed_results if r.get("ok", False) and (key in r)]
+        if not vals:
+            out[algo] = {"n": 0, "mean_sec": None, "std_sec": None, "mean_sec_per_stage": None}
+            continue
+        mean_sec = float(np.mean(vals))
+        std_sec = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+        per_stage = (mean_sec / float(t_final)) if float(t_final) > 0 else None
+        out[algo] = {
+            "n": int(len(vals)),
+            "mean_sec": mean_sec,
+            "std_sec": std_sec,
+            "mean_sec_per_stage": per_stage,
+        }
+    return out
 
 
 def main():
@@ -329,11 +379,20 @@ def main():
             if r.get("elapsed_sec") is not None:
                 seed_durations.append(float(r.get("elapsed_sec", 0.0)))
             if r.get("ok", False):
+                main_t = r.get("main_elapsed_sec", None)
+                main1_t = r.get("main1_elapsed_sec", None)
+                main2_t = r.get("main2_elapsed_sec", None)
+                t_msg = (
+                    f"t_main={float(main_t):.1f}s t_main1={float(main1_t):.1f}s t_main2={float(main2_t):.1f}s"
+                    if (main_t is not None and main1_t is not None and main2_t is not None)
+                    else ""
+                )
                 print(
                     f"[done] seed={seed} ok "
                     f"main={len(r.get('main_rmse', {}))} "
                     f"main1={len(r.get('main1_rmse', {}))} "
-                    f"main2={len(r.get('main2_rmse', {}))}"
+                    f"main2={len(r.get('main2_rmse', {}))} "
+                    f"{t_msg}".strip()
                 )
             else:
                 failures.append(seed)
@@ -354,11 +413,20 @@ def main():
                 if r.get("elapsed_sec") is not None:
                     seed_durations.append(float(r.get("elapsed_sec", 0.0)))
                 if r.get("ok", False):
+                    main_t = r.get("main_elapsed_sec", None)
+                    main1_t = r.get("main1_elapsed_sec", None)
+                    main2_t = r.get("main2_elapsed_sec", None)
+                    t_msg = (
+                        f"t_main={float(main_t):.1f}s t_main1={float(main1_t):.1f}s t_main2={float(main2_t):.1f}s"
+                        if (main_t is not None and main1_t is not None and main2_t is not None)
+                        else ""
+                    )
                     print(
                         f"[done] seed={seed} ok "
                         f"main={len(r.get('main_rmse', {}))} "
                         f"main1={len(r.get('main1_rmse', {}))} "
-                        f"main2={len(r.get('main2_rmse', {}))}"
+                        f"main2={len(r.get('main2_rmse', {}))} "
+                        f"{t_msg}".strip()
                     )
                 else:
                     failures.append(seed)
@@ -372,12 +440,14 @@ def main():
         "main1": _trend_stats(agg["main1_mean"]),
         "main2": _trend_stats(agg["main2_mean"]),
     }
+    timing = _timing_stats(results, cfg["data"]["t_final"])
 
     summary = {
         "config": cfg,
         "results": results,
         "aggregate": agg,
         "trend_stats": stats,
+        "timing_stats": timing,
         "num_failures": len(failures),
         "failed_seeds": failures,
     }
@@ -390,6 +460,9 @@ def main():
     print(f"[trend] main={stats['main']}")
     print(f"[trend] main1={stats['main1']}")
     print(f"[trend] main2={stats['main2']}")
+    print(f"[timing] main={timing['main']}")
+    print(f"[timing] main1={timing['main1']}")
+    print(f"[timing] main2={timing['main2']}")
 
     if failures:
         raise SystemExit(f"Benchmark finished with failures: {failures}")

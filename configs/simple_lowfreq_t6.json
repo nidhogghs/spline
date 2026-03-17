@@ -1,0 +1,55 @@
+{
+  "experiment": {
+    "checkpoint_root": "checkpoints",
+    "checkpoint_dir": "main_simple_lowfreq_t6",
+    "history_json": "checkpoints/main_simple_lowfreq_t6/history.json"
+  },
+  "model": {
+    "P": 60,
+    "k": 3,
+    "knot_step": 0.1,
+    "signal_idx": [1, 2, 3],
+    "beta": {
+      "specs": [
+        {
+          "type": "trig_mix",
+          "bias": 0.10,
+          "terms": [
+            { "kind": "cos", "amplitude": 0.60, "frequency_pi": 0.50, "phase": 0.00 }
+          ]
+        },
+        {
+          "type": "trig_mix",
+          "bias": -0.05,
+          "terms": [
+            { "kind": "sin", "amplitude": 0.55, "frequency_pi": 0.75, "phase": 0.10 }
+          ]
+        },
+        {
+          "type": "trig_mix",
+          "bias": 0.00,
+          "terms": [
+            { "kind": "cos", "amplitude": 0.45, "frequency_pi": 1.00, "phase": 0.20 }
+          ]
+        }
+      ]
+    }
+  },
+  "data": {
+    "t_final": 6,
+    "n_per_segment": 80,
+    "sigma": 0.15,
+    "seed_data": 8
+  },
+  "train": {
+    "seed_cv": 2025,
+    "use_1se": true,
+    "save_checkpoint_data": false,
+    "heartbeat_sec": 20,
+    "local_window_units": 2.0,
+    "local_support_margin": 0.0
+  },
+  "run": {
+    "load_only": false
+  }
+}
