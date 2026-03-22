@@ -3,3 +3,10 @@ venv/*
 EXPERIMENT_PLAN_LOCAL.md
 logs/reconstruction_records/*.json
 
+# 实验输出（带时间戳）
+experiments/
+
+# 散落在根目录的旧可视化文件
+viz_*.png
+
+

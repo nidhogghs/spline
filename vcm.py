@@ -1,3 +1,14 @@
+"""
+真正的增量 VCM (Varying-Coefficient Model) 算法。
+
+核心思想：
+- Stage 1: 在 [0,1] 上做完整的 group-lasso 拟合
+- Stage s>1: 扩展到 [0,s]
+  - O (Old) 区间的 basis 系数冻结不动
+  - 只在 C+N (Cross + New) 区间的数据上做优化
+  - C = 跨越旧边界的 basis，N = 完全在新区间的 basis
+  - 不使用 Old 区间的数据做误差计算或参数优化
+"""
 import argparse
 import json
 import os
@@ -8,6 +19,10 @@ import numpy as np
 from numpy.linalg import norm
 from scipy.interpolate import BSpline
 
+
+# =========================================================
+# 0) 工具函数
+# =========================================================
 
 def _str2bool(s):
     if isinstance(s, bool):
@@ -80,7 +95,7 @@ def true_beta_funcs_default(scales=None):
     if scales is None:
         scales = [1.0, 1.0, 1.0, 1.0, 1.0]
     return [
-        lambda t: scales[0] * (-0.5 + 0.6 * np.cos(2 * np.pi * t)),
+        lambda t: scales[0] * (-0.5 + 0.6 * np.cos(2 * np.pi * t)) + 0.15 * np.log1p(0.3 * np.asarray(t, dtype=float)),
         lambda t: scales[1] * (-0.5 + 0.6 * np.cos(2 * np.pi * t)),
         lambda t: scales[2] * (0.7 * np.sin(4 * np.pi * t)),
         lambda t: scales[3] * (0.7 * np.sin(4 * np.pi * t)),
@@ -186,6 +201,10 @@ def build_beta_functions_from_config(beta_cfg):
     raise ValueError("Unsupported beta config format. Use {'specs': [...]} or {'scales': [...]} or a list.")
 
 
+# =========================================================
+# 1) 数据模拟器
+# =========================================================
+
 class VCMSimulator:
     def __init__(self, P, signal_idx, beta_funcs, sigma, seed_base=0, standardize_X=True):
         self.P = int(P)
@@ -212,6 +231,10 @@ class VCMSimulator:
         y = np.sum(X * beta_true, axis=1) + self.sigma * rng_e.standard_normal(int(n))
         return t, X, y, beta_true
 
+
+# =========================================================
+# 2) B-spline / VCM 基础函数
+# =========================================================
 
 def make_global_knots(a, b, k, knot_step):
     a = float(a)
@@ -264,43 +287,75 @@ def _predict_from_coef_matrix(B, X, coef_mat):
     return np.sum(np.asarray(X, dtype=float) * beta_hat, axis=1)
 
 
-def _lipschitz_from_gram(XtX):
-    XtX = np.asarray(XtX, dtype=float)
-    if XtX.size == 0:
-        return 1.0
-    try:
-        Ls = float(np.linalg.eigvalsh(XtX)[-1])
-    except np.linalg.LinAlgError:
-        Ls = float(np.linalg.norm(XtX, 2))
-    if (not np.isfinite(Ls)) or Ls <= 0:
-        return 1.0
-    return Ls
+def post_lasso_debias(Phi, y, c_lasso, m, P, active_thresh=1e-8):
+    """
+    Post-Lasso Debiasing: 对 Group-Lasso 选出的活跃组做无惩罚 OLS 重拟合。
+
+    参数:
+        Phi: (n, P*m) 的 VCM 设计矩阵
+        y: (n,) 响应变量
+        c_lasso: (P*m,) Group-Lasso 得到的系数
+        m: B-spline basis 数量
+        P: 协变量数量
+        active_thresh: 判断组是否活跃的阈值
+
+    返回:
+        c_debias: (P*m,) debiased 后的系数
+        active_groups: 活跃组的索引列表
+    """
+    blocks = split_blocks(c_lasso, m, P)
+    active_groups = []
+    for p in range(P):
+        if float(norm(blocks[p])) > active_thresh:
+            active_groups.append(p)
+
+    if len(active_groups) == 0:
+        return c_lasso.copy(), active_groups
+
+    # 构建活跃组的列索引
+    active_cols = []
+    for p in active_groups:
+        active_cols.extend(range(p * m, (p + 1) * m))
+    active_cols = np.array(active_cols, dtype=int)
+
+    # 提取活跃组的设计矩阵子集
+    Phi_active = Phi[:, active_cols]
+
+    # OLS 重拟合 (使用 lstsq 确保数值稳定)
+    c_active, _, _, _ = np.linalg.lstsq(Phi_active, y, rcond=None)
+
+    # 组装完整的 debiased 系数
+    c_debias = np.zeros_like(c_lasso)
+    c_debias[active_cols] = c_active
+
+    return c_debias, active_groups
 
 
-def _apply_smooth_gram(B, X, coef_mat):
-    beta_hat = B @ coef_mat.T
-    pred = np.sum(X * beta_hat, axis=1)
-    return (X * pred[:, None]).T @ B
+def post_lasso_debias_cn(Phi_cn, y_cn_res, c_cn_lasso, m_cn, P, active_thresh=1e-8):
+    """
+    Post-Lasso Debiasing (增量版): 对 CN 区间的活跃组做 OLS 重拟合。
+
+    与 post_lasso_debias 逻辑完全一致，只是作用于 CN 子空间。
+
+    参数:
+        Phi_cn: (n_cn, P*m_cn) CN 区间的 VCM 设计矩阵
+        y_cn_res: (n_cn,) 减去 frozen(O) 后的残差
+        c_cn_lasso: (P*m_cn,) CN 空间的 Group-Lasso 系数
+        m_cn: CN basis 数量
+        P: 协变量数量
+        active_thresh: 判断组是否活跃的阈值
+
+    返回:
+        c_cn_debias: (P*m_cn,) debiased 后的系数
+        active_groups: 活跃组的索引列表
+    """
+    return post_lasso_debias(Phi_cn, y_cn_res, c_cn_lasso, m_cn, P, active_thresh)
 
 
-def _estimate_lipschitz_design(B, X, max_iter=30, tol=1e-6):
-    P = X.shape[1]
-    m = B.shape[1]
-    v = np.ones((P, m), dtype=float)
-    v /= max(norm(v), 1e-12)
-    eig_prev = 0.0
 
-    for _ in range(int(max_iter)):
-        w = _apply_smooth_gram(B, X, v)
-        eig = float(norm(w))
-        if (not np.isfinite(eig)) or eig <= 0:
-            return 1.0
-        v = w / eig
-        if abs(eig - eig_prev) <= tol * max(1.0, eig):
-            break
-        eig_prev = eig
 
-    return max(1.0, eig * 1.02)
+
+
 
 
 def gram_R(knots, k, a, b, grid=3000):
@@ -329,125 +384,57 @@ def _safe_cholesky(R, jitter=1e-10):
     return np.linalg.cholesky(R + 1e-6 * eye)
 
 
-def lambda_max_R(B, X, y, R, w):
-    B = np.asarray(B, dtype=float)
-    X = np.asarray(X, dtype=float)
-    y = np.asarray(y, dtype=float)
-    m = B.shape[1]
+def lambda_max_R(Phi, y, m, R):
+    """计算 lambda_max（与 main.py 原始版本一致，接受 VCM 设计矩阵 Phi）。"""
     L = _safe_cholesky(R)
-    weighted_xy = X * y[:, None]
-    g = weighted_xy.T @ B
-    u = np.linalg.solve(L.T, g.T).T
-    denom = np.maximum(np.asarray(w, dtype=float), 1e-12)
-    return float(np.max(np.linalg.norm(u, axis=1) / denom))
+    P = Phi.shape[1] // m
+    lam = 0.0
+    for p in range(P):
+        g = Phi[:, p * m:(p + 1) * m].T @ y
+        u = np.linalg.solve(L.T, g)
+        lam = max(lam, float(norm(u)))
+    return lam
 
 
 def group_soft_thresh(blocks, tau, R, lam, w):
-    block_mat = np.asarray(blocks, dtype=float)
-    if block_mat.ndim == 1:
-        block_mat = block_mat[None, :]
-    quad = np.einsum("ij,ij->i", block_mat @ R, block_mat)
-    norms = np.sqrt(np.maximum(quad, 0.0))
-    thresh = float(tau * lam) * np.asarray(w, dtype=float)
-    scale = np.zeros_like(norms)
-    active = norms > thresh
-    scale[active] = 1.0 - thresh[active] / norms[active]
-    out = block_mat * scale[:, None]
-    return [out[i].copy() for i in range(out.shape[0])]
+    out = []
+    for v, wp in zip(blocks, w):
+        nr = float(np.sqrt(max(0.0, v.T @ R @ v)))
+        thr = tau * lam * wp
+        out.append(np.zeros_like(v) if nr <= thr else (1 - thr / nr) * v)
+    return out
 
 
-def fista_group_lasso(XtX, Xty, lam, m, P, R, w, max_iter=6000, tol=1e-7, Ls=None, init=None):
-    m = int(m)
-    P = int(P)
+def fista_group_lasso(XtX, Xty, lam, m, P, R, w, max_iter=6000, tol=1e-7):
+    """显式 Gram 矩阵版 FISTA group-lasso（与 main.py 原始版本一致）。"""
     d = m * P
-
-    if Ls is None:
-        Ls = _lipschitz_from_gram(XtX)
-    else:
-        Ls = float(Ls)
-        if (not np.isfinite(Ls)) or Ls <= 0:
-            Ls = 1.0
+    Ls = float(np.linalg.norm(XtX, 2))
+    Ls = Ls if (np.isfinite(Ls) and Ls > 0) else 1.0
     step = 1.0 / Ls
 
-    if init is None:
-        c = np.zeros(d, dtype=float)
-    else:
-        c = np.asarray(init, dtype=float).reshape(d).copy()
+    c = np.zeros(d)
     z = c.copy()
     tN = 1.0
-    w = np.asarray(w, dtype=float)
 
-    for _ in range(int(max_iter)):
+    for _ in range(max_iter):
         grad = XtX @ z - Xty
-        yv_mat = _coef_to_block_matrix(z - step * grad, m, P)
-        quad = np.einsum("ij,ij->i", yv_mat @ R, yv_mat)
-        norms = np.sqrt(np.maximum(quad, 0.0))
-        thresh = step * float(lam) * w
-        scale = np.zeros_like(norms)
-        active = norms > thresh
-        scale[active] = 1.0 - thresh[active] / norms[active]
-        c_new = (yv_mat * scale[:, None]).reshape(d)
+        yv = z - step * grad
+        yb = split_blocks(yv, m, P)
+        c_new = np.concatenate(group_soft_thresh(yb, step, R, lam, w))
 
-        t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * tN * tN))
-        z = c_new + ((tN - 1.0) / t_new) * (c_new - c)
+        t_new = 0.5 * (1 + np.sqrt(1 + 4 * tN * tN))
+        z = c_new + (tN - 1) / t_new * (c_new - c)
 
         if norm(c_new - c) <= tol * max(1.0, norm(c)):
             return c_new
-
-        c = c_new
-        tN = t_new
+        c, tN = c_new, t_new
 
     return c
 
 
-def fista_group_lasso_design(B, X, y, lam, R, w, max_iter=6000, tol=1e-7, Ls=None, init=None):
-    B = np.asarray(B, dtype=float)
-    X = np.asarray(X, dtype=float)
-    y = np.asarray(y, dtype=float)
-    m = B.shape[1]
-    P = X.shape[1]
-    d = m * P
-
-    if Ls is None:
-        Ls = _estimate_lipschitz_design(B, X)
-    else:
-        Ls = float(Ls)
-        if (not np.isfinite(Ls)) or Ls <= 0:
-            Ls = 1.0
-    step = 1.0 / Ls
-
-    Xty_blocks = (X * y[:, None]).T @ B
-    if init is None:
-        c = np.zeros(d, dtype=float)
-    else:
-        c = np.asarray(init, dtype=float).reshape(d).copy()
-    z = c.copy()
-    tN = 1.0
-    w = np.asarray(w, dtype=float)
-
-    for _ in range(int(max_iter)):
-        z_mat = _coef_to_block_matrix(z, m, P)
-        grad_mat = _apply_smooth_gram(B, X, z_mat) - Xty_blocks
-        yv_mat = z_mat - step * grad_mat
-        quad = np.einsum("ij,ij->i", yv_mat @ R, yv_mat)
-        norms = np.sqrt(np.maximum(quad, 0.0))
-        thresh = step * float(lam) * w
-        scale = np.zeros_like(norms)
-        active = norms > thresh
-        scale[active] = 1.0 - thresh[active] / norms[active]
-        c_new = (yv_mat * scale[:, None]).reshape(d)
-
-        t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * tN * tN))
-        z = c_new + ((tN - 1.0) / t_new) * (c_new - c)
-
-        if norm(c_new - c) <= tol * max(1.0, norm(c)):
-            return c_new
-
-        c = c_new
-        tN = t_new
-
-    return c
-
+# =========================================================
+# 3) CV 和 lambda 路径
+# =========================================================
 
 def kfold_indices(n, K=5, seed=2025):
     rng = np.random.default_rng(int(seed))
@@ -464,6 +451,7 @@ def make_lambda_path(lam_max, n_lam=30, min_ratio=5e-4):
 
 
 def cv_select_lambda_plain(B, X, y, R, lam_path, K=5, seed=2025, use_1se=True):
+    """Stage 1 的 plain CV（无 frozen 部分），使用显式 Gram 矩阵。"""
     n = len(y)
     P = X.shape[1]
     m = B.shape[1]
@@ -480,25 +468,15 @@ def cv_select_lambda_plain(B, X, y, R, lam_path, K=5, seed=2025, use_1se=True):
         Xtr, Xv = X[tr], X[val]
         ytr, yv = y[tr], y[val]
 
+        Phi_tr = build_vcm_design(Btr, Xtr)
+        Phi_v = build_vcm_design(Bv, Xv)
+        XtX = Phi_tr.T @ Phi_tr
+        Xty = Phi_tr.T @ ytr
         w_tr = group_weights(Btr, Xtr)
-        Ls = _estimate_lipschitz_design(Btr, Xtr)
-        c_prev = np.zeros(m * P, dtype=float)
 
         for li, lam in enumerate(lam_path):
-            c = fista_group_lasso_design(
-                Btr,
-                Xtr,
-                ytr,
-                float(lam),
-                R,
-                w_tr,
-                Ls=Ls,
-                init=c_prev,
-            )
-            c_prev = c
-            mse[li, kf] = float(
-                np.mean((yv - _predict_from_coef_matrix(Bv, Xv, _coef_to_block_matrix(c, m, P))) ** 2)
-            )
+            c = fista_group_lasso(XtX, Xty, float(lam), m, P, R, w_tr)
+            mse[li, kf] = float(np.mean((yv - Phi_v @ c) ** 2))
 
     mm = mse.mean(axis=1)
     best = int(np.argmin(mm))
@@ -508,6 +486,127 @@ def cv_select_lambda_plain(B, X, y, R, lam_path, K=5, seed=2025, use_1se=True):
         best = int(np.where(mm <= thr)[0][0])
     return float(lam_path[best])
 
+
+def cv_select_lambda_frozen_cn(B_cn, X_cn, y_cn_res, R_cn, lam_path, K=5, seed=2025, use_1se=True):
+    """
+    真正增量的 Frozen-CV：只在 CN 区间数据上做交叉验证。
+    使用显式 Gram 矩阵版 FISTA。
+
+    y_cn_res 已经是减去 frozen(O+C) 贡献后的残差。
+    只需在优化区间的 basis 上做普通的 group-lasso CV。
+    """
+    n = len(y_cn_res)
+    P = X_cn.shape[1]
+    m_cn = B_cn.shape[1]
+    folds = kfold_indices(n, K=K, seed=seed)
+    mse = np.zeros((len(lam_path), len(folds)), dtype=float)
+    all_idx = np.arange(n)
+
+    for kf, val in enumerate(folds):
+        tr_mask = np.ones(n, dtype=bool)
+        tr_mask[val] = False
+        tr = all_idx[tr_mask]
+
+        Btr, Bv = B_cn[tr], B_cn[val]
+        Xtr, Xv = X_cn[tr], X_cn[val]
+        ytr, yv = y_cn_res[tr], y_cn_res[val]
+
+        Phi_tr = build_vcm_design(Btr, Xtr)
+        Phi_v = build_vcm_design(Bv, Xv)
+        XtX = Phi_tr.T @ Phi_tr
+        Xty = Phi_tr.T @ ytr
+        w_tr = group_weights(Btr, Xtr)
+
+        for li, lam in enumerate(lam_path):
+            c = fista_group_lasso(XtX, Xty, float(lam), m_cn, P, R_cn, w_tr)
+            y_pred = Phi_v @ c
+            mse[li, kf] = float(np.mean((yv - y_pred) ** 2))
+
+    mm = mse.mean(axis=1)
+    best = int(np.argmin(mm))
+    if use_1se and len(folds) > 1:
+        se = mse.std(axis=1, ddof=1) / np.sqrt(len(folds))
+        thr = mm[best] + se[best]
+        best = int(np.where(mm <= thr)[0][0])
+
+    return float(lam_path[best])
+
+
+def apply_relax(idx_new_matched, knots_new, k, r_relax):
+    """
+    将最靠近边界的 r_relax 个 basis 从 O 中释放出来（加入 CN）。
+    与 main.py 原始版本一致。
+    """
+    idx_new_matched = np.asarray(idx_new_matched, dtype=int)
+    if r_relax <= 0 or len(idx_new_matched) <= r_relax:
+        return idx_new_matched, np.array([], dtype=int)
+
+    right_end = np.array([knots_new[j + k] for j in idx_new_matched], dtype=float)
+    order = np.argsort(right_end)
+
+    move = np.zeros_like(idx_new_matched, dtype=bool)
+    move[order[-r_relax:]] = True
+
+    idx_o = idx_new_matched[~move]
+    idx_relaxed = idx_new_matched[move]
+    return idx_o, idx_relaxed
+
+
+def adaptive_cn_refit(B_cn, X, y_res, R_cn, lam_path,
+                      seed_cv=2025, use_1se=True, eps=1e-6, delta=1.0):
+    """
+    One-step adaptive group-lasso in CN space（与 main.py 原始版本一致）:
+    - warm fit (use weak lambda) -> r0 -> w_ad
+    - CV over lam_path with w_ad
+    - final refit
+    """
+    n = len(y_res)
+    P = X.shape[1]
+    m_cn = B_cn.shape[1]
+
+    Phi = build_vcm_design(B_cn, X)
+
+    # Warm fit: use the smallest lambda (weak penalty) as initialization
+    lam_warm = float(lam_path[-1])
+    w_warm = group_weights(B_cn, X)
+    c0 = fista_group_lasso(Phi.T @ Phi, Phi.T @ y_res, lam_warm, m_cn, P, R_cn, w_warm)
+
+    blocks0 = split_blocks(c0, m_cn, P)
+    r0 = np.array([float(np.sqrt(max(0.0, b.T @ R_cn @ b))) for b in blocks0])
+    w_ad = 1.0 / (r0 + eps) ** delta
+
+    folds = kfold_indices(n, K=5, seed=seed_cv)
+    mse = np.zeros((len(lam_path), 5))
+
+    for li, lam in enumerate(lam_path):
+        for kf, val in enumerate(folds):
+            tr = np.setdiff1d(np.arange(n), val)
+            Btr, Bv = B_cn[tr], B_cn[val]
+            Xtr, Xv = X[tr], X[val]
+            ytr, yv = y_res[tr], y_res[val]
+
+            Phi_tr = build_vcm_design(Btr, Xtr)
+            Phi_v = build_vcm_design(Bv, Xv)
+
+            c_tmp = fista_group_lasso(Phi_tr.T @ Phi_tr, Phi_tr.T @ ytr,
+                                      float(lam), m_cn, P, R_cn, w_ad)
+            mse[li, kf] = np.mean((yv - Phi_v @ c_tmp) ** 2)
+
+    mm = mse.mean(1)
+    best = int(np.argmin(mm))
+    if use_1se:
+        se = mse.std(1, ddof=1) / np.sqrt(5)
+        thr = mm[best] + se[best]
+        best = int(np.where(mm <= thr)[0][0])
+
+    lam_best = float(lam_path[best])
+    c_final = fista_group_lasso(Phi.T @ Phi, Phi.T @ y_res, lam_best, m_cn, P, R_cn, w_ad)
+    return lam_best, c_final
+
+
+# =========================================================
+# 4) OCN 分区
+# =========================================================
 
 def local_span_matrix(knots, k):
     t = np.asarray(knots, dtype=float)
@@ -593,7 +692,6 @@ def debug_partition_report(part, old_end, max_show=3):
     show_examples("C(new)", idx_c_new, spans_new)
     show_examples("N(new)", idx_n_new, spans_new)
 
-    # Checks requested by theory
     ok_o = True
     for old_i, new_j in zip(idx_o_old.tolist(), idx_o_new.tolist()):
         if not np.allclose(spans_old[old_i], spans_new[new_j], atol=1e-10, rtol=0):
@@ -609,82 +707,47 @@ def debug_partition_report(part, old_end, max_show=3):
     print(f"[debug] verify N spans absent in old: {not n_has_old}")
 
 
-def cv_select_lambda_frozen(B_full, X, y, R_full, lam_path, idx_o, c_o_mat, K=5, seed=2025, use_1se=True):
-    n_all, m_full = B_full.shape
-    P = X.shape[1]
-    folds = kfold_indices(n_all, K=K, seed=seed)
+# =========================================================
+# 5) 真正的增量 Trainer
+# =========================================================
 
-    idx_all = np.arange(m_full, dtype=int)
-    idx_cn = np.setdiff1d(idx_all, np.asarray(idx_o, dtype=int))
-    R_cn = R_full[np.ix_(idx_cn, idx_cn)]
-
-    mse = np.zeros((len(lam_path), len(folds)), dtype=float)
-    all_idx = np.arange(n_all)
-    m_cn = len(idx_cn)
-
-    for kf, val in enumerate(folds):
-        tr_mask = np.ones(n_all, dtype=bool)
-        tr_mask[val] = False
-        tr = all_idx[tr_mask]
-
-        Btr, Bv = B_full[tr], B_full[val]
-        Xtr, Xv = X[tr], X[val]
-        ytr, yv = y[tr], y[val]
-
-        Btr_o, Bv_o = Btr[:, idx_o], Bv[:, idx_o]
-        Btr_cn, Bv_cn = Btr[:, idx_cn], Bv[:, idx_cn]
-
-        frozen_tr = _predict_from_coef_matrix(Btr_o, Xtr, c_o_mat)
-        frozen_v = _predict_from_coef_matrix(Bv_o, Xv, c_o_mat)
-
-        ytr_res = ytr - frozen_tr
-        w_tr = group_weights(Btr_cn, Xtr)
-        Ls = _estimate_lipschitz_design(Btr_cn, Xtr)
-        c_prev = np.zeros(m_cn * P, dtype=float)
-
-        for li, lam in enumerate(lam_path):
-            c_cn = fista_group_lasso_design(
-                Btr_cn,
-                Xtr,
-                ytr_res,
-                float(lam),
-                R_cn,
-                w_tr,
-                Ls=Ls,
-                init=c_prev,
-            )
-            c_prev = c_cn
-            y_pred = frozen_v + _predict_from_coef_matrix(Bv_cn, Xv, _coef_to_block_matrix(c_cn, m_cn, P))
-            mse[li, kf] = float(np.mean((yv - y_pred) ** 2))
-
-    mm = mse.mean(axis=1)
-    best = int(np.argmin(mm))
-    if use_1se and len(folds) > 1:
-        se = mse.std(axis=1, ddof=1) / np.sqrt(len(folds))
-        thr = mm[best] + se[best]
-        best = int(np.where(mm <= thr)[0][0])
-
-    return float(lam_path[best])
+def _compute_cn_data_range(knots_new, k, idx_cn):
+    """
+    计算 CN basis 函数的 support 覆盖的数据范围 [cn_left, cn_right]。
+    任何 t 值落入此区间的数据点才与 CN basis 有关。
+    """
+    left_new, right_new = basis_supports(knots_new, k)
+    cn_left = float(np.min(left_new[idx_cn]))
+    cn_right = float(np.max(right_new[idx_cn]))
+    return cn_left, cn_right
 
 
 class IncrementalVCMTrainer:
-    def __init__(self, k, knot_step, P, seed_cv=2025, use_1se=True, debug=False):
+    """
+    真正的增量 VCM Trainer。
+
+    关键特性：
+    - 不累积全部历史数据 (t_all / X_all / y_all)
+    - extend_one_stage 只在 C+N 区间的数据上做优化和 CV
+    - O 区间的系数冻结不动，误差计算只在 CN 区间上
+    """
+
+    def __init__(self, k, knot_step, P, seed_cv=2025, use_1se=False, r_relax=0, adaptive=False, debug=False):
         self.k = int(k)
         self.knot_step = float(knot_step)
         self.P = int(P)
         self.seed_cv = int(seed_cv)
         self.use_1se = bool(use_1se)
+        self.r_relax = int(r_relax)
+        self.adaptive = bool(adaptive)
         self.debug = bool(debug)
 
         self.t_end = None
         self.knots = None
-        self.coef_blocks = None
+        self.coef_blocks = None  # list of length P, each is (m,) array
 
-        self.t_all = None
-        self.X_all = None
-        self.y_all = None
-
-    def save_checkpoint(self, prefix_path, save_data=True):
+    def save_checkpoint(self, prefix_path):
+        """保存模型状态（不保存数据，因为真增量不需要累积数据）。"""
         if self.t_end is None:
             raise RuntimeError("Nothing to save.")
 
@@ -695,28 +758,19 @@ class IncrementalVCMTrainer:
             "P": int(self.P),
             "seed_cv": int(self.seed_cv),
             "use_1se": bool(self.use_1se),
+            "r_relax": int(self.r_relax),
+            "adaptive": bool(self.adaptive),
         }
 
         coef_mat = np.stack(self.coef_blocks, axis=0)
 
         os.makedirs(os.path.dirname(prefix_path) or ".", exist_ok=True)
-        if bool(save_data):
-            np.savez_compressed(
-                prefix_path + ".npz",
-                t_all=self.t_all,
-                X_all=self.X_all,
-                y_all=self.y_all,
-                knots=self.knots,
-                coef_mat=coef_mat,
-            )
-        else:
-            np.savez_compressed(
-                prefix_path + ".npz",
-                knots=self.knots,
-                coef_mat=coef_mat,
-            )
+        np.savez_compressed(
+            prefix_path + ".npz",
+            knots=self.knots,
+            coef_mat=coef_mat,
+        )
 
-        meta["save_data"] = bool(save_data)
         with open(prefix_path + ".json", "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
@@ -731,6 +785,8 @@ class IncrementalVCMTrainer:
             P=meta["P"],
             seed_cv=meta["seed_cv"],
             use_1se=meta["use_1se"],
+            r_relax=meta.get("r_relax", 0),
+            adaptive=meta.get("adaptive", False),
             debug=debug,
         )
 
@@ -745,58 +801,40 @@ class IncrementalVCMTrainer:
         obj.coef_blocks = [coef_mat[p].copy() for p in range(coef_mat.shape[0])]
         obj.t_end = float(meta["t_end"])
 
-
-        if "t_all" in arr and "X_all" in arr and "y_all" in arr:
-            obj.t_all = arr["t_all"]
-            obj.X_all = arr["X_all"]
-            obj.y_all = arr["y_all"]
-        else:
-            obj.t_all = None
-            obj.X_all = None
-            obj.y_all = None
-
         return obj
 
     def fit_stage1(self, t, X, y):
+        """
+        Stage 1: 在 [0,1] 上做完整的 group-lasso 拟合。
+        这是初始阶段，使用全部数据。
+        使用显式 Gram 矩阵版 FISTA（与 main.py 原始版本一致）。
+        """
         self.t_end = 1.0
-        self.t_all = np.asarray(t, dtype=float).copy()
-        self.X_all = np.asarray(X, dtype=float).copy()
-        self.y_all = np.asarray(y, dtype=float).copy()
+        t = np.asarray(t, dtype=float)
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
 
         self.knots = make_global_knots(0.0, 1.0, self.k, self.knot_step)
-        B = bspline_design_matrix(self.t_all, self.knots, self.k)
+        B = bspline_design_matrix(t, self.knots, self.k)
         m = B.shape[1]
 
+        Phi = build_vcm_design(B, X)
         R = gram_R(self.knots, self.k, 0.0, 1.0)
-        w_full = group_weights(B, self.X_all)
+        w_full = group_weights(B, X)
 
-        lam_max = lambda_max_R(B, self.X_all, self.y_all, R, w_full)
+        lam_max = lambda_max_R(Phi, y, m, R)
         lam_path = make_lambda_path(lam_max)
 
         lam_best = cv_select_lambda_plain(
-            B,
-            self.X_all,
-            self.y_all,
-            R,
-            lam_path,
-            K=5,
-            seed=self.seed_cv,
-            use_1se=self.use_1se,
+            B, X, y, R, lam_path,
+            K=5, seed=self.seed_cv, use_1se=self.use_1se,
         )
 
-        c = fista_group_lasso_design(
-            B,
-            self.X_all,
-            self.y_all,
-            lam_best,
-            R,
-            w_full,
-            Ls=_estimate_lipschitz_design(B, self.X_all),
-        )
+        c = fista_group_lasso(Phi.T @ Phi, Phi.T @ y, lam_best, m, self.P, R, w_full)
         self.coef_blocks = split_blocks(c, m, self.P)
 
-        yhat = _predict_from_coef_matrix(B, self.X_all, np.stack(self.coef_blocks, axis=0))
-        rmse = float(np.sqrt(np.mean((self.y_all - yhat) ** 2)))
+        yhat = Phi @ c
+        rmse = float(np.sqrt(np.mean((y - yhat) ** 2)))
 
         return {
             "stage": 1,
@@ -806,7 +844,26 @@ class IncrementalVCMTrainer:
             "train_rmse": rmse,
         }
 
-    def extend_one_stage(self, next_end, t_seg, X_seg, y_seg):
+    def extend_one_stage(self, next_end, t_cn, X_cn, y_cn):
+        """
+        真正的增量扩展：从 [0, t_end] 扩展到 [0, next_end]。
+
+        关键特性（保持增量）：
+        - t_cn / X_cn / y_cn 只包含 C+N 区间的数据（不是全部历史数据）
+        - O basis 的系数冻结不动
+        - 只在 CN 数据上做优化、CV、误差计算
+
+        算法质量改进（与 main.py 原始版一致）：
+        - 使用显式 Gram 矩阵 (Φ^TΦ) + 精确谱范数的 FISTA
+        - 支持 r_relax：将最靠近边界的 basis 从 O 中释放加入 CN
+        - 支持 adaptive_cn_refit：自适应 group-lasso 二次拟合
+
+        参数：
+            next_end: 新的时间终点（= t_end + 1）
+            t_cn: CN 区间的时间数据
+            X_cn: CN 区间的协变量数据
+            y_cn: CN 区间的响应数据
+        """
         if self.t_end is None:
             raise RuntimeError("Call fit_stage1 first.")
 
@@ -815,64 +872,99 @@ class IncrementalVCMTrainer:
         if next_end <= old_end + 1e-12:
             raise ValueError("next_end must be > current t_end.")
 
-        self.t_all = np.r_[self.t_all, np.asarray(t_seg, dtype=float)]
-        self.X_all = np.vstack([self.X_all, np.asarray(X_seg, dtype=float)])
-        self.y_all = np.r_[self.y_all, np.asarray(y_seg, dtype=float)]
+        t_cn = np.asarray(t_cn, dtype=float)
+        X_cn = np.asarray(X_cn, dtype=float)
+        y_cn = np.asarray(y_cn, dtype=float)
 
         knots_old = self.knots.copy()
         coef_old = [c.copy() for c in self.coef_blocks]
 
+        # 构造新的全局 knot 序列
         knots_new = make_global_knots(0.0, next_end, self.k, self.knot_step)
-        B_full = bspline_design_matrix(self.t_all, knots_new, self.k)
-        m_full = B_full.shape[1]
 
+        # OCN 分区
         part = partition_OCN(knots_old, knots_new, self.k, old_end=old_end)
-        idx_o_new = part["idx_o_new"]
-        idx_o_old = part["idx_o_old"]
-        idx_cn = part["idx_cn_new"]
+        idx_o_new_matched = part["idx_o_new"]
+        idx_o_old_matched = part["idx_o_old"]
+        m_full = len(knots_new) - (self.k + 1)
+
+        # r_relax：将最靠近边界的 basis 从 O 中释放
+        idx_o_new, idx_relaxed = apply_relax(idx_o_new_matched, knots_new, self.k, self.r_relax)
+
+        # 建立 new -> old 映射，过滤出对应的 old idx
+        new2old = {int(j): int(i) for i, j in zip(idx_o_old_matched.tolist(), idx_o_new_matched.tolist())}
+        idx_o_old = np.array([new2old[int(j)] for j in idx_o_new], dtype=int)
+
+        # 重新计算 CN = 全部 - O（含被 relax 释放的）
+        idx_all_new = np.arange(m_full, dtype=int)
+        idx_cn = np.setdiff1d(idx_all_new, idx_o_new)
 
         if self.debug:
             debug_partition_report(part, old_end=old_end, max_show=3)
+            print(f"[debug] r_relax={self.r_relax}, relaxed={len(idx_relaxed)}, "
+                  f"O_final={len(idx_o_new)}, CN_final={len(idx_cn)}")
 
+        # 冻结的 O 系数矩阵: (P, |O|)
         c_o_mat = np.stack([coef_old[p][idx_o_old] for p in range(self.P)], axis=0)
 
-        B_o = B_full[:, idx_o_new]
-        frozen_y = np.sum(self.X_all * (B_o @ c_o_mat.T), axis=1)
-        y_res = self.y_all - frozen_y
+        # 只在 CN 数据上构造设计矩阵
+        B_cn_data = bspline_design_matrix(t_cn, knots_new, self.k)
 
-        B_cn = B_full[:, idx_cn]
+        # O basis 在 CN 数据上的冻结贡献
+        B_cn_data_o = B_cn_data[:, idx_o_new]
+        frozen_y = np.sum(X_cn * (B_cn_data_o @ c_o_mat.T), axis=1)
+
+        # 残差 = y_cn - frozen(O)
+        y_cn_res = y_cn - frozen_y
+
+        # CN basis 在 CN 数据上的设计矩阵
+        B_cn_data_cn = B_cn_data[:, idx_cn]
+        m_cn = B_cn_data_cn.shape[1]
+
+        # Gram 矩阵：在全局 [0, next_end] 上积分
         R_full = gram_R(knots_new, self.k, 0.0, next_end)
         R_cn = R_full[np.ix_(idx_cn, idx_cn)]
 
-        w_cn = group_weights(B_cn, self.X_all)
+        # VCM 设计矩阵
+        Phi_cn = build_vcm_design(B_cn_data_cn, X_cn)
 
-        lam_max = lambda_max_R(B_cn, self.X_all, y_res, R_cn, w_cn)
+        # group weights
+        w_cn = group_weights(B_cn_data_cn, X_cn)
+
+        # lambda 路径
+        lam_max = lambda_max_R(Phi_cn, y_cn_res, m_cn, R_cn)
         lam_path = make_lambda_path(lam_max)
 
-        lam_best = cv_select_lambda_frozen(
-            B_full=B_full,
-            X=self.X_all,
-            y=self.y_all,
-            R_full=R_full,
+        # CV 选择 lambda（只在 CN 数据上做 CV）
+        lam_best = cv_select_lambda_frozen_cn(
+            B_cn=B_cn_data_cn,
+            X_cn=X_cn,
+            y_cn_res=y_cn_res,
+            R_cn=R_cn,
             lam_path=lam_path,
-            idx_o=idx_o_new,
-            c_o_mat=c_o_mat,
             K=5,
             seed=self.seed_cv,
             use_1se=self.use_1se,
         )
 
-        c_cn = fista_group_lasso_design(
-            B_cn,
-            self.X_all,
-            y_res,
-            lam_best,
-            R_cn,
-            w_cn,
-            Ls=_estimate_lipschitz_design(B_cn, self.X_all),
+        # 初始 CN 拟合
+        c_cn_vec = fista_group_lasso(
+            Phi_cn.T @ Phi_cn, Phi_cn.T @ y_cn_res,
+            lam_best, m_cn, self.P, R_cn, w_cn,
         )
 
-        blocks_cn = split_blocks(c_cn, B_cn.shape[1], self.P)
+        # Adaptive refit（可选）
+        lam_ad = None
+        if self.adaptive:
+            lam_ad, c_cn_use = adaptive_cn_refit(
+                B_cn_data_cn, X_cn, y_cn_res, R_cn, lam_path,
+                seed_cv=self.seed_cv, use_1se=self.use_1se,
+            )
+        else:
+            c_cn_use = c_cn_vec
+
+        # 组装完整系数向量
+        blocks_cn = split_blocks(c_cn_use, m_cn, self.P)
         coef_new = []
         for p in range(self.P):
             cp = np.zeros(m_full, dtype=float)
@@ -880,12 +972,14 @@ class IncrementalVCMTrainer:
             cp[idx_cn] = blocks_cn[p]
             coef_new.append(cp)
 
+        # 更新状态
         self.t_end = next_end
         self.knots = knots_new
         self.coef_blocks = coef_new
 
-        yhat = _predict_from_coef_matrix(B_full, self.X_all, np.stack(self.coef_blocks, axis=0))
-        rmse = float(np.sqrt(np.mean((self.y_all - yhat) ** 2)))
+        # RMSE 只在 CN 数据上计算
+        yhat_cn = frozen_y + Phi_cn @ c_cn_use
+        rmse_cn = float(np.sqrt(np.mean((y_cn - yhat_cn) ** 2)))
 
         return {
             "stage": int(round(next_end)),
@@ -895,8 +989,12 @@ class IncrementalVCMTrainer:
             "num_C": int(len(part["idx_c_new"])),
             "num_N": int(len(part["idx_n_new"])),
             "num_CN": int(len(idx_cn)),
+            "num_relaxed": int(len(idx_relaxed)),
+            "n_cn_data": int(len(t_cn)),
+            "cn_data_range": [float(t_cn.min()), float(t_cn.max())],
             "lambda_best": float(lam_best),
-            "train_rmse": rmse,
+            "lambda_ad": float(lam_ad) if lam_ad is not None else None,
+            "train_rmse_cn": rmse_cn,
         }
 
     def predict(self, t, X):
@@ -907,21 +1005,60 @@ class IncrementalVCMTrainer:
         return np.sum(X * beta_hat, axis=1)
 
 
-def rebuild_cached_data_until(sim, t_end, n_per_segment):
-    t_list = []
-    X_list = []
-    y_list = []
-    stage_end = int(round(float(t_end)))
-    for seg in range(stage_end):
-        a = float(seg)
-        b = float(seg + 1)
-        t_seg, X_seg, y_seg, _ = sim.sample_segment(a, b, int(n_per_segment), segment_id=seg)
-        t_list.append(t_seg)
-        X_list.append(X_seg)
-        y_list.append(y_seg)
+# =========================================================
+# 6) 数据采集辅助：为 CN 区间采集数据
+# =========================================================
 
-    return np.concatenate(t_list), np.vstack(X_list), np.concatenate(y_list)
+def collect_cn_data(sim, knots_new, k, idx_cn, old_end, next_end, n_per_segment,
+                    prev_seg_t=None, prev_seg_X=None, prev_seg_y=None):
+    """
+    为 CN 区间收集数据。
 
+    C basis 跨越 old_end 边界，其 support 可能延伸到 [old_end - k*knot_step, old_end]。
+    N basis 完全在新区间 [old_end, next_end]。
+
+    数据来源：
+    1. 上一段数据中落在 CN support 范围内的部分（用于 C basis 的旧侧覆盖）
+    2. 当前段的全部新采样数据（用于 C+N basis）
+
+    参数：
+        prev_seg_t/X/y: 上一个 segment 的数据（如果可用），用于给 C basis 在旧侧提供数据
+    """
+    cn_left, cn_right = _compute_cn_data_range(knots_new, k, idx_cn)
+
+    t_parts = []
+    X_parts = []
+    y_parts = []
+
+    # 上一段数据中落在 CN support 范围内的部分
+    if prev_seg_t is not None and prev_seg_X is not None and prev_seg_y is not None:
+        prev_t = np.asarray(prev_seg_t, dtype=float)
+        prev_X = np.asarray(prev_seg_X, dtype=float)
+        prev_y = np.asarray(prev_seg_y, dtype=float)
+        # 筛选落在 CN basis support 范围 [cn_left, old_end) 的数据
+        mask_prev = (prev_t >= cn_left - 1e-10) & (prev_t < old_end + 1e-10)
+        if mask_prev.sum() > 0:
+            t_parts.append(prev_t[mask_prev])
+            X_parts.append(prev_X[mask_prev])
+            y_parts.append(prev_y[mask_prev])
+
+    # 当前段的新采样数据 [old_end, next_end]
+    seg_id = int(round(old_end))
+    t_seg, X_seg, y_seg, _ = sim.sample_segment(old_end, next_end, int(n_per_segment), segment_id=seg_id)
+    t_parts.append(t_seg)
+    X_parts.append(X_seg)
+    y_parts.append(y_seg)
+
+    t_cn = np.concatenate(t_parts)
+    X_cn_data = np.vstack(X_parts)
+    y_cn = np.concatenate(y_parts)
+
+    return t_cn, X_cn_data, y_cn, t_seg, X_seg, y_seg
+
+
+# =========================================================
+# 7) Driver 函数
+# =========================================================
 
 def run_or_resume_incremental(
     checkpoint_dir,
@@ -935,8 +1072,9 @@ def run_or_resume_incremental(
     knot_step=0.1,
     seed_data=0,
     seed_cv=2025,
-    use_1se=True,
-    save_checkpoint_data=True,
+    use_1se=False,
+    r_relax=0,
+    adaptive=False,
     debug=False,
     heartbeat_sec=90.0,
     progress_hook=None,
@@ -964,8 +1102,14 @@ def run_or_resume_incremental(
     total_stages = int(round(t_final))
     hb_stop = threading.Event()
     hb_thread = None
+
+    # 保留上一段数据，用于给下一阶段的 C basis 提供旧侧数据
+    prev_seg_t = None
+    prev_seg_X = None
+    prev_seg_y = None
+
     if start_end is None:
-        trainer = IncrementalVCMTrainer(k=k, knot_step=knot_step, P=P, seed_cv=seed_cv, use_1se=use_1se, debug=debug)
+        trainer = IncrementalVCMTrainer(k=k, knot_step=knot_step, P=P, seed_cv=seed_cv, use_1se=use_1se, r_relax=r_relax, adaptive=adaptive, debug=debug)
         hb_thread = _start_heartbeat_watcher(
             "main1",
             stage_getter=lambda: trainer.t_end or 0.0,
@@ -978,11 +1122,15 @@ def run_or_resume_incremental(
         stage_started = time.time()
         t0, X0, y0, _ = sim.sample_segment(0.0, 1.0, int(n_per_segment), segment_id=0)
         info = trainer.fit_stage1(t0, X0, y0)
-        trainer.save_checkpoint(ckpt_path(1), save_data=save_checkpoint_data)
+        trainer.save_checkpoint(ckpt_path(1))
         info["elapsed_sec"] = float(time.time() - stage_started)
         history.append(info)
         if callable(progress_hook):
             progress_hook(dict(info))
+        # 保留 stage1 的数据作为 prev_seg
+        prev_seg_t = t0
+        prev_seg_X = X0
+        prev_seg_y = y0
 
     else:
         trainer = IncrementalVCMTrainer.load_checkpoint(ckpt_path(start_end), debug=debug)
@@ -1002,20 +1150,21 @@ def run_or_resume_incremental(
         if int(trainer.k) != int(k):
             raise ValueError(
                 f"Checkpoint k={trainer.k} 与当前参数 k={k} 不一致。"
-                f"请使用新的 --checkpoint-dir，或先删除目录 {checkpoint_dir} 后重跑。"
             )
         if abs(float(trainer.knot_step) - float(knot_step)) > 1e-12:
             raise ValueError(
                 f"Checkpoint knot_step={trainer.knot_step} 与当前参数 knot_step={knot_step} 不一致。"
-                f"请使用新的 --checkpoint-dir，或先删除目录 {checkpoint_dir} 后重跑。"
             )
         history.append({"loaded_from": ckpt_path(start_end), "t_end": trainer.t_end})
 
-    if trainer.t_all is None or trainer.X_all is None or trainer.y_all is None:
-        t_all, X_all, y_all = rebuild_cached_data_until(sim, trainer.t_end, n_per_segment)
-        trainer.t_all = t_all
-        trainer.X_all = X_all
-        trainer.y_all = y_all
+        # 恢复上一段数据（用于给下一阶段的 C basis 提供数据）
+        prev_end = float(trainer.t_end)
+        prev_seg_id = int(round(prev_end)) - 1
+        prev_a = float(prev_seg_id)
+        prev_b = prev_a + 1.0
+        prev_seg_t, prev_seg_X, prev_seg_y, _ = sim.sample_segment(
+            prev_a, prev_b, int(n_per_segment), segment_id=prev_seg_id
+        )
 
     while trainer.t_end + 1e-12 < t_final:
         cur = float(trainer.t_end)
@@ -1024,14 +1173,36 @@ def run_or_resume_incremental(
         print(f"[stage-start] stage={int(round(nxt))}/{int(round(t_final))} P={P} n={int(n_per_segment)}", flush=True)
 
         stage_started = time.time()
-        t_seg, X_seg, y_seg, _ = sim.sample_segment(cur, nxt, int(n_per_segment), segment_id=seg_id)
-        info = trainer.extend_one_stage(nxt, t_seg, X_seg, y_seg)
 
-        trainer.save_checkpoint(ckpt_path(nxt), save_data=save_checkpoint_data)
+        # 构造下一阶段的 knots 和分区，确定 CN 数据范围
+        knots_new = make_global_knots(0.0, nxt, trainer.k, trainer.knot_step)
+        part = partition_OCN(trainer.knots, knots_new, trainer.k, old_end=cur)
+        idx_cn = part["idx_cn_new"]
+
+        # 收集 CN 区间的数据
+        t_cn, X_cn, y_cn, cur_seg_t, cur_seg_X, cur_seg_y = collect_cn_data(
+            sim, knots_new, trainer.k, idx_cn, cur, nxt, n_per_segment,
+            prev_seg_t=prev_seg_t, prev_seg_X=prev_seg_X, prev_seg_y=prev_seg_y,
+        )
+
+        if debug:
+            cn_left, cn_right = _compute_cn_data_range(knots_new, trainer.k, idx_cn)
+            print(f"[debug] CN data: n={len(t_cn)} range=[{t_cn.min():.4f}, {t_cn.max():.4f}]", flush=True)
+            print(f"[debug] CN basis support: [{cn_left:.4f}, {cn_right:.4f}]", flush=True)
+
+        # 执行增量扩展（只用 CN 数据）
+        info = trainer.extend_one_stage(nxt, t_cn, X_cn, y_cn)
+
+        trainer.save_checkpoint(ckpt_path(nxt))
         info["elapsed_sec"] = float(time.time() - stage_started)
         history.append(info)
         if callable(progress_hook):
             progress_hook(dict(info))
+
+        # 当前段数据变为下一阶段的 prev_seg
+        prev_seg_t = cur_seg_t
+        prev_seg_X = cur_seg_X
+        prev_seg_y = cur_seg_y
 
     hb_stop.set()
     if hb_thread is not None:
@@ -1039,6 +1210,10 @@ def run_or_resume_incremental(
 
     return trainer, history
 
+
+# =========================================================
+# 8) 辅助函数
+# =========================================================
 
 def _resolve_checkpoint_base(checkpoint_dir, root="checkpoints"):
     ck = str(checkpoint_dir).strip()
@@ -1065,8 +1240,10 @@ def _get_cfg(cfg, section, key, default):
 def _summarize_rmse_history(history):
     stage_rmse = []
     for h in history:
-        if isinstance(h, dict) and ("stage" in h) and ("train_rmse" in h):
-            stage_rmse.append((int(h["stage"]), float(h["train_rmse"])))
+        if isinstance(h, dict) and ("stage" in h):
+            rmse = h.get("train_rmse_cn", h.get("train_rmse", None))
+            if rmse is not None:
+                stage_rmse.append((int(h["stage"]), float(rmse)))
     stage_rmse.sort(key=lambda x: x[0])
     if len(stage_rmse) <= 1:
         return stage_rmse, []
@@ -1114,14 +1291,18 @@ def _find_latest_checkpoint(checkpoint_dir):
     return best
 
 
+# =========================================================
+# 9) main 入口
+# =========================================================
+
 def main():
-    parser = argparse.ArgumentParser(description="Incremental VCM with strict O/C/N update.")
+    parser = argparse.ArgumentParser(description="True Incremental VCM: only uses C+N data for optimization.")
     parser.add_argument("--config", default="", help="Path to JSON config file.")
     parser.add_argument("--tag", default="default")
     parser.add_argument("--checkpoint-dir", default="")
 
     parser.add_argument("--t-final", type=float, default=3.0)
-    parser.add_argument("--n-per-segment", type=int, default=400)
+    parser.add_argument("--n-per-segment", type=int, default=600)
     parser.add_argument("--P", type=int, default=100)
     parser.add_argument("--signal-idx", default="1,2,3,4,5")
     parser.add_argument("--beta-scales", default="1,1,1,1,1")
@@ -1132,9 +1313,10 @@ def main():
 
     parser.add_argument("--seed-data", type=int, default=0)
     parser.add_argument("--seed-cv", type=int, default=2025)
-    parser.add_argument("--use-1se", type=_str2bool, default=True)
+    parser.add_argument("--use-1se", type=_str2bool, default=False)
+    parser.add_argument("--r-relax", type=int, default=0, help="Number of bases near boundary to release from freezing.")
+    parser.add_argument("--adaptive", type=_str2bool, default=False, help="Enable adaptive group-lasso refit.")
 
-    parser.add_argument("--save-checkpoint-data", type=_str2bool, default=True)
     parser.add_argument("--history-json", default="")
     parser.add_argument("--debug", type=_str2bool, default=False)
     parser.add_argument("--heartbeat-sec", type=float, default=90.0, help="Heartbeat interval in seconds; <=0 disables.")
@@ -1184,20 +1366,18 @@ def main():
 
     def _progress(info):
         stg = info.get("stage", info.get("t_end", "?"))
-        rmse = info.get("train_rmse", None)
-        mse = info.get("train_mse", None)
-        if mse is None and rmse is not None:
+        rmse = info.get("train_rmse_cn", info.get("train_rmse", None))
+        mse = None
+        if rmse is not None:
             try:
                 mse = float(rmse) ** 2
             except Exception:
                 mse = None
 
         if rmse is not None and mse is not None:
-            print(f"[progress] stage={stg} rmse={float(rmse):.6g} mse={float(mse):.6g}", flush=True)
+            print(f"[progress] stage={stg} rmse_cn={float(rmse):.6g} mse_cn={float(mse):.6g}", flush=True)
         elif rmse is not None:
-            print(f"[progress] stage={stg} rmse={float(rmse):.6g}", flush=True)
-        elif mse is not None:
-            print(f"[progress] stage={stg} mse={float(mse):.6g}", flush=True)
+            print(f"[progress] stage={stg} rmse_cn={float(rmse):.6g}", flush=True)
         else:
             print(f"[progress] stage={stg}", flush=True)
 
@@ -1214,7 +1394,8 @@ def main():
         seed_data=int(_get_cfg(cfg, "data", "seed_data", args.seed_data)),
         seed_cv=int(_get_cfg(cfg, "train", "seed_cv", args.seed_cv)),
         use_1se=bool(_get_cfg(cfg, "train", "use_1se", args.use_1se)),
-        save_checkpoint_data=bool(_get_cfg(cfg, "train", "save_checkpoint_data", args.save_checkpoint_data)),
+        r_relax=int(_get_cfg(cfg, "train", "r_relax", args.r_relax)),
+        adaptive=bool(_get_cfg(cfg, "train", "adaptive", args.adaptive)),
         debug=bool(_get_cfg(cfg, "train", "debug", args.debug)),
         heartbeat_sec=float(_get_cfg(cfg, "train", "heartbeat_sec", args.heartbeat_sec)),
         progress_hook=_progress,
