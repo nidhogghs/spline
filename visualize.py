@@ -37,6 +37,66 @@ def load_history(history_json):
         return json.load(f)
 
 
+def rebuild_history_from_checkpoints(checkpoint_dir, beta_funcs, signal_idx, k=3, knot_step=0.1):
+    """
+    当 history.json 没有训练指标时，从所有 checkpoint 文件回溯构建 history。
+    为每个 stage 加载 checkpoint 并计算 beta RMSE。
+
+    返回 history 列表，每条记录包含 stage, t_end, beta_rmse（各信号变量 beta RMSE 的平均值）。
+    """
+    import re
+    # 找到所有 ckpt_tXXX.json
+    ckpt_stages = []
+    for fn in os.listdir(checkpoint_dir):
+        m = re.match(r"ckpt_t(\d+)\.json$", fn)
+        if m:
+            ckpt_stages.append(int(m.group(1)))
+    ckpt_stages.sort()
+
+    if not ckpt_stages:
+        return []
+
+    history = []
+    for stage in ckpt_stages:
+        prefix = os.path.join(checkpoint_dir, f"ckpt_t{stage}")
+        try:
+            trainer = IncrementalVCMTrainer.load_checkpoint(prefix)
+        except Exception:
+            continue
+
+        t_end = float(trainer.t_end)
+        # 计算各信号变量的 beta RMSE
+        n_grid = 300
+        t_grid = np.linspace(0, t_end, n_grid)
+        B_grid = bspline_design_matrix(t_grid, trainer.knots, trainer.k)
+        coef_mat = np.stack(trainer.coef_blocks, axis=0)
+
+        beta_rmses = []
+        for idx, p in enumerate(signal_idx):
+            beta_true = beta_funcs[idx % len(beta_funcs)](t_grid)
+            beta_hat = B_grid @ coef_mat[p]
+            rmse_val = float(np.sqrt(np.mean((beta_true - beta_hat) ** 2)))
+            beta_rmses.append(rmse_val)
+
+        avg_rmse = float(np.mean(beta_rmses))
+
+        # 计算活跃变量数 (L2 范数 > 1e-8)
+        norms = np.linalg.norm(coef_mat, axis=1)
+        n_active = int(np.sum(norms > 1e-8))
+        n_basis = len(trainer.knots) - (trainer.k + 1)
+
+        history.append({
+            "stage": stage,
+            "t_end": t_end,
+            "train_rmse_cn": avg_rmse,
+            "beta_rmses": beta_rmses,  # 各信号变量独立 RMSE
+            "n_active_vars": n_active,
+            "n_basis": n_basis,
+        })
+
+    return history
+
+
 def plot_rmse_curve(history, ax, title="RMSE by Stage (CN)"):
     """绘制 RMSE 随 stage 变化的曲线"""
     stages = []
@@ -151,7 +211,84 @@ def plot_cn_data_count(history, ax, title="CN Data Points per Stage"):
     ax2.legend(loc="center right", fontsize=9)
 
 
-def plot_beta_functions(trainer, beta_funcs, signal_idx, t_final, ax_list, n_grid=500):
+def plot_active_vars_curve(history, ax, title="Active Variables by Stage"):
+    """绘制活跃变量数随 stage 变化的曲线"""
+    stages = []
+    n_active = []
+    for h in history:
+        if isinstance(h, dict) and "stage" in h and "n_active_vars" in h:
+            stages.append(int(h["stage"]))
+            n_active.append(int(h["n_active_vars"]))
+
+    if not stages:
+        ax.text(0.5, 0.5, "No active vars data", ha="center", va="center", transform=ax.transAxes)
+        return
+
+    ax.plot(stages, n_active, "s-", color="#009688", linewidth=2, markersize=5, label="Active vars")
+    ax.set_xlabel("Stage", fontsize=12)
+    ax.set_ylabel("# Active Variables", fontsize=12)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10)
+
+    ax.annotate(f"{n_active[-1]}", (stages[-1], n_active[-1]),
+                textcoords="offset points", xytext=(10, 5), fontsize=9, color="#4CAF50")
+
+
+def plot_nbasis_curve(history, ax, title="Number of Basis Functions by Stage"):
+    """绘制 B-spline 基函数数量随 stage 变化"""
+    stages = []
+    n_basis = []
+    for h in history:
+        if isinstance(h, dict) and "stage" in h and "n_basis" in h:
+            stages.append(int(h["stage"]))
+            n_basis.append(int(h["n_basis"]))
+
+    if not stages:
+        ax.text(0.5, 0.5, "No basis data", ha="center", va="center", transform=ax.transAxes)
+        return
+
+    ax.plot(stages, n_basis, "o-", color="#FF5722", linewidth=2, markersize=5, label="n_basis")
+    ax.set_xlabel("Stage", fontsize=12)
+    ax.set_ylabel("# Basis Functions", fontsize=12)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10)
+
+    ax.annotate(f"{n_basis[-1]}", (stages[-1], n_basis[-1]),
+                textcoords="offset points", xytext=(10, 5), fontsize=9, color="#333")
+
+
+def plot_per_signal_rmse(history, signal_idx, ax, title="Per-Signal Beta RMSE by Stage"):
+    """绘制每个信号变量的 beta RMSE 随 stage 变化"""
+    stages = []
+    all_rmses = []  # list of lists
+    for h in history:
+        if isinstance(h, dict) and "stage" in h and "beta_rmses" in h:
+            stages.append(int(h["stage"]))
+            all_rmses.append(h["beta_rmses"])
+
+    if not stages:
+        ax.text(0.5, 0.5, "No per-signal RMSE data", ha="center", va="center", transform=ax.transAxes)
+        return
+
+    colors = ["#1976D2", "#D32F2F", "#388E3C", "#F57C00", "#7B1FA2",
+              "#00BCD4", "#E91E63", "#8BC34A", "#FF5722", "#607D8B"]
+    all_rmses = np.array(all_rmses)  # (n_stages, n_signals)
+    for idx in range(all_rmses.shape[1]):
+        p = signal_idx[idx] if idx < len(signal_idx) else idx
+        c = colors[idx % len(colors)]
+        ax.plot(stages, all_rmses[:, idx], "-", color=c, linewidth=1.5,
+                alpha=0.7, label=f"β_{p}")
+
+    ax.set_xlabel("Stage", fontsize=12)
+    ax.set_ylabel("Beta RMSE", fontsize=12)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, ncol=2, loc="upper right")
+
+
+def plot_beta_functions(trainer, beta_funcs, signal_idx, t_final, ax_list, n_grid=500, t_range=None):
     """
     绘制每个信号变量的 beta(t) 拟合对比：真实 vs 估计。
 
@@ -162,8 +299,11 @@ def plot_beta_functions(trainer, beta_funcs, signal_idx, t_final, ax_list, n_gri
         t_final: 时间终点
         ax_list: Axes 列表，每个信号变量一个
         n_grid: 网格点数
+        t_range: 可选的 (t_lo, t_hi) 元组，限制绘图范围
     """
-    t_grid = np.linspace(0, float(t_final), n_grid)
+    t_lo = t_range[0] if t_range else 0
+    t_hi = t_range[1] if t_range else float(t_final)
+    t_grid = np.linspace(t_lo, t_hi, n_grid)
     B_grid = bspline_design_matrix(t_grid, trainer.knots, trainer.k)
     coef_mat = np.stack(trainer.coef_blocks, axis=0)  # (P, m)
 
@@ -193,9 +333,11 @@ def plot_beta_functions(trainer, beta_funcs, signal_idx, t_final, ax_list, n_gri
                 bbox=dict(boxstyle="round,pad=0.2", facecolor="lightyellow", alpha=0.8))
 
 
-def plot_beta_error_heatmap(trainer, beta_funcs, signal_idx, t_final, ax, n_grid=500):
+def plot_beta_error_heatmap(trainer, beta_funcs, signal_idx, t_final, ax, n_grid=500, t_range=None):
     """绘制各信号变量 beta(t) 误差的热力图 (t × signal_idx)"""
-    t_grid = np.linspace(0, float(t_final), n_grid)
+    t_lo = t_range[0] if t_range else 0
+    t_hi = t_range[1] if t_range else float(t_final)
+    t_grid = np.linspace(t_lo, t_hi, n_grid)
     B_grid = bspline_design_matrix(t_grid, trainer.knots, trainer.k)
     coef_mat = np.stack(trainer.coef_blocks, axis=0)
 
@@ -208,7 +350,7 @@ def plot_beta_error_heatmap(trainer, beta_funcs, signal_idx, t_final, ax, n_grid
     error_mat = np.array(errors)  # (num_signals, n_grid)
 
     im = ax.imshow(error_mat, aspect="auto", cmap="RdBu_r",
-                   extent=[0, float(t_final), len(signal_idx) - 0.5, -0.5],
+                   extent=[t_lo, t_hi, len(signal_idx) - 0.5, -0.5],
                    vmin=-np.percentile(np.abs(error_mat), 95),
                    vmax=np.percentile(np.abs(error_mat), 95))
     ax.set_xlabel("t", fontsize=12)
@@ -254,6 +396,7 @@ def main():
     parser.add_argument("--history-json", default="", help="Override history JSON path.")
     parser.add_argument("--output", default="", help="Output PNG path (default: auto-generated).")
     parser.add_argument("--dpi", type=int, default=150, help="Output DPI.")
+    parser.add_argument("--t-range", default="", help="Comma-separated t range for beta plots, e.g. '80,100'. Default: full [0, t_final].")
     args = parser.parse_args()
 
     # --- 解析配置 ---
@@ -296,7 +439,7 @@ def main():
         print(f"[WARN] History file not found: {history_json}")
         history = []
 
-    # --- 解析 beta 函数和 signal_idx ---
+    # --- 解析 beta 函数和 signal_idx（先于 history 检查，因为 rebuild 需要） ---
     signal_idx_cfg = _get_cfg(cfg, "model", "signal_idx", "1,2,3,4,5")
     signal_idx = _parse_int_list(signal_idx_cfg)
 
@@ -310,9 +453,36 @@ def main():
     t_final = float(trainer.t_end)
     n_signals = len(signal_idx)
 
+    # 检查 history 是否含有效训练数据
+    has_valid_history = any(
+        isinstance(h, dict) and "stage" in h and "train_rmse_cn" in h
+        for h in history
+    )
+    if not has_valid_history:
+        print("[INFO] History has no training metrics. Rebuilding from checkpoints...")
+        history = rebuild_history_from_checkpoints(
+            checkpoint_dir, beta_funcs, signal_idx,
+            k=trainer.k, knot_step=trainer.knot_step
+        )
+        if history:
+            print(f"[INFO] Rebuilt history: {len(history)} stages from checkpoints")
+        else:
+            print("[WARN] Could not rebuild history from checkpoints")
+
+    # 解析 t-range
+    t_range = None
+    if args.t_range:
+        parts = args.t_range.split(",")
+        if len(parts) != 2:
+            print(f"[ERROR] --t-range expects two comma-separated values, got: {args.t_range}", file=sys.stderr)
+            sys.exit(1)
+        t_range = (float(parts[0]), float(parts[1]))
+        print(f"Using t-range: [{t_range[0]}, {t_range[1]}]")
+
     out_dir = checkpoint_dir if not args.output else os.path.dirname(args.output) or "."
     os.makedirs(out_dir, exist_ok=True)
     saved_files = []
+    range_suffix = f"_t{int(t_range[0])}-{int(t_range[1])}" if t_range else ""
 
     # ========== 图1: 训练指标总览 (2x2) ==========
     fig1, axes1 = plt.subplots(2, 2, figsize=(16, 10))
@@ -323,16 +493,31 @@ def main():
     )
 
     if history:
-        plot_rmse_curve(history, axes1[0, 0])
-        plot_lambda_curve(history, axes1[0, 1])
-        plot_timing_curve(history, axes1[1, 0])
-        plot_cn_data_count(history, axes1[1, 1])
+        # 检查是原始 history 还是 rebuild 的
+        has_lambda = any(isinstance(h, dict) and "lambda_best" in h for h in history)
+        has_timing = any(isinstance(h, dict) and "elapsed_sec" in h for h in history)
+
+        plot_rmse_curve(history, axes1[0, 0], title="Beta RMSE by Stage" if not has_lambda else "RMSE by Stage (CN)")
+        if has_lambda:
+            plot_lambda_curve(history, axes1[0, 1])
+        else:
+            plot_active_vars_curve(history, axes1[0, 1])
+        if has_timing:
+            plot_timing_curve(history, axes1[1, 0])
+        else:
+            plot_nbasis_curve(history, axes1[1, 0])
+        # 右下角：有 CN 数据时显示 CN，否则显示各信号变量 RMSE
+        has_cn = any(isinstance(h, dict) and "n_cn_data" in h and int(h["n_cn_data"]) > 0 for h in history)
+        if has_cn:
+            plot_cn_data_count(history, axes1[1, 1])
+        else:
+            plot_per_signal_rmse(history, signal_idx, axes1[1, 1])
     else:
         for ax in axes1.flat:
             ax.text(0.5, 0.5, "No history data", ha="center", va="center", transform=ax.transAxes)
 
     fig1.tight_layout(rect=[0, 0, 1, 0.93])
-    p1 = os.path.join(out_dir, "viz_1_training_summary.png")
+    p1 = os.path.join(out_dir, f"viz_1_training_summary{range_suffix}.png")
     fig1.savefig(p1, dpi=args.dpi, bbox_inches="tight", facecolor="white")
     saved_files.append(p1)
     plt.close(fig1)
@@ -343,7 +528,8 @@ def main():
     fig2, axes2 = plt.subplots(n_rows_beta, n_cols_beta,
                                 figsize=(6 * n_cols_beta, 4.5 * n_rows_beta),
                                 squeeze=False)
-    fig2.suptitle("Beta Functions: True vs Estimated", fontsize=15, fontweight="bold")
+    range_label = f" (t∈[{t_range[0]:.0f},{t_range[1]:.0f}])" if t_range else ""
+    fig2.suptitle(f"Beta Functions: True vs Estimated{range_label}", fontsize=15, fontweight="bold")
 
     ax_beta_list = []
     for i in range(n_signals):
@@ -357,23 +543,23 @@ def main():
         col = i % n_cols_beta
         axes2[row, col].set_visible(False)
 
-    plot_beta_functions(trainer, beta_funcs, signal_idx, t_final, ax_beta_list)
+    plot_beta_functions(trainer, beta_funcs, signal_idx, t_final, ax_beta_list, t_range=t_range)
 
     fig2.tight_layout(rect=[0, 0, 1, 0.93])
-    p2 = os.path.join(out_dir, "viz_2_beta_functions.png")
+    p2 = os.path.join(out_dir, f"viz_2_beta_functions{range_suffix}.png")
     fig2.savefig(p2, dpi=args.dpi, bbox_inches="tight", facecolor="white")
     saved_files.append(p2)
     plt.close(fig2)
 
     # ========== 图3: Error Heatmap + Sparsity ==========
     fig3, axes3 = plt.subplots(1, 2, figsize=(16, 5))
-    fig3.suptitle("Estimation Error & Sparsity Analysis", fontsize=15, fontweight="bold")
+    fig3.suptitle(f"Estimation Error & Sparsity Analysis{range_label}", fontsize=15, fontweight="bold")
 
-    plot_beta_error_heatmap(trainer, beta_funcs, signal_idx, t_final, axes3[0])
+    plot_beta_error_heatmap(trainer, beta_funcs, signal_idx, t_final, axes3[0], t_range=t_range)
     plot_sparsity_pattern(trainer, signal_idx, axes3[1])
 
     fig3.tight_layout(rect=[0, 0, 1, 0.92])
-    p3 = os.path.join(out_dir, "viz_3_error_sparsity.png")
+    p3 = os.path.join(out_dir, f"viz_3_error_sparsity{range_suffix}.png")
     fig3.savefig(p3, dpi=args.dpi, bbox_inches="tight", facecolor="white")
     saved_files.append(p3)
     plt.close(fig3)

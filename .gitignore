@@ -1,12 +1,29 @@
-checkpoints/*
-venv/*
-EXPERIMENT_PLAN_LOCAL.md
-logs/reconstruction_records/*.json
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+venv/
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# CodeBuddy 工具数据（不要删除本地，但不提交）
+.codebuddy/
+
+# Checkpoint 与训练产物
+checkpoints/
+
+# 日志与可视化输出
+logs/
+viz_*.png
 
 # 实验输出（带时间戳）
 experiments/
 
-# 散落在根目录的旧可视化文件
-viz_*.png
-
-
+# 杂项
+EXPERIMENT_PLAN_LOCAL.md
