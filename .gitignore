@@ -15,6 +15,9 @@ venv/
 # CodeBuddy 工具数据（不要删除本地，但不提交）
 .codebuddy/
 
+# Codex local scratch files
+.codex_tmp/
+
 # Checkpoint 与训练产物
 checkpoints/
 

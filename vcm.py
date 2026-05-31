@@ -287,6 +287,45 @@ def _predict_from_coef_matrix(B, X, coef_mat):
     return np.sum(np.asarray(X, dtype=float) * beta_hat, axis=1)
 
 
+def _lipschitz_from_gram(XtX):
+    XtX = np.asarray(XtX, dtype=float)
+    if XtX.size == 0:
+        return 1.0
+    try:
+        Ls = float(np.linalg.eigvalsh(XtX)[-1])
+    except np.linalg.LinAlgError:
+        Ls = float(np.linalg.norm(XtX, 2))
+    if (not np.isfinite(Ls)) or Ls <= 0:
+        return 1.0
+    return Ls
+
+
+def _apply_smooth_gram(B, X, coef_mat):
+    beta_hat = B @ coef_mat.T
+    pred = np.sum(X * beta_hat, axis=1)
+    return (X * pred[:, None]).T @ B
+
+
+def _estimate_lipschitz_design(B, X, max_iter=30, tol=1e-6):
+    P = X.shape[1]
+    m = B.shape[1]
+    v = np.ones((P, m), dtype=float)
+    v /= max(norm(v), 1e-12)
+    eig_prev = 0.0
+
+    for _ in range(int(max_iter)):
+        w = _apply_smooth_gram(B, X, v)
+        eig = float(norm(w))
+        if (not np.isfinite(eig)) or eig <= 0:
+            return 1.0
+        v = w / eig
+        if abs(eig - eig_prev) <= tol * max(1.0, eig):
+            break
+        eig_prev = eig
+
+    return max(1.0, eig * 1.02)
+
+
 def post_lasso_debias(Phi, y, c_lasso, m, P, active_thresh=1e-8):
     """
     Post-Lasso Debiasing: 对 Group-Lasso 选出的活跃组做无惩罚 OLS 重拟合。
@@ -352,6 +391,55 @@ def post_lasso_debias_cn(Phi_cn, y_cn_res, c_cn_lasso, m_cn, P, active_thresh=1e
     return post_lasso_debias(Phi_cn, y_cn_res, c_cn_lasso, m_cn, P, active_thresh)
 
 
+def smooth_refit_active(
+    Phi,
+    y,
+    c_lasso,
+    m,
+    P,
+    R_smooth,
+    alpha,
+    active_thresh=1e-8,
+    penalty_rhs=None,
+):
+    """
+    Refit selected groups with a second-derivative roughness penalty.
+
+    This preserves group-lasso variable selection but replaces the shrunken,
+    locally noisy coefficients by a smooth penalized least-squares fit.
+    """
+    alpha = float(alpha)
+    if alpha <= 0:
+        return c_lasso.copy(), []
+
+    blocks = split_blocks(c_lasso, m, P)
+    active_groups = [p for p in range(P) if float(norm(blocks[p])) > active_thresh]
+    if not active_groups:
+        return c_lasso.copy(), active_groups
+
+    active_cols = []
+    for p in active_groups:
+        active_cols.extend(range(p * m, (p + 1) * m))
+    active_cols = np.array(active_cols, dtype=int)
+
+    Phi_active = Phi[:, active_cols]
+    R_smooth = np.asarray(R_smooth, dtype=float)
+    penalty = np.kron(np.eye(len(active_groups), dtype=float), R_smooth)
+    lhs = Phi_active.T @ Phi_active + alpha * penalty
+    rhs = Phi_active.T @ y
+    if penalty_rhs is not None:
+        rhs = rhs - alpha * np.asarray(penalty_rhs, dtype=float)[active_cols]
+
+    try:
+        c_active = np.linalg.solve(lhs, rhs)
+    except np.linalg.LinAlgError:
+        c_active, _, _, _ = np.linalg.lstsq(lhs, rhs, rcond=None)
+
+    c_refit = np.zeros_like(c_lasso)
+    c_refit[active_cols] = c_active
+    return c_refit, active_groups
+
+
 
 
 
@@ -361,6 +449,25 @@ def post_lasso_debias_cn(Phi_cn, y_cn_res, c_cn_lasso, m_cn, P, active_thresh=1e
 def gram_R(knots, k, a, b, grid=3000):
     gx = np.linspace(float(a), float(b), int(grid))
     B = bspline_design_matrix(gx, knots, k)
+    w = np.ones(gx.shape[0], dtype=float)
+    w[0] *= 0.5
+    w[-1] *= 0.5
+    w *= (float(b) - float(a)) / (gx.shape[0] - 1)
+    return B.T @ (B * w[:, None])
+
+
+def roughness_R(knots, k, a, b, deriv=2, grid=3000):
+    t = np.asarray(knots, dtype=float)
+    k = int(k)
+    deriv = int(deriv)
+    m = len(t) - (k + 1)
+    if deriv > k:
+        return np.zeros((m, m), dtype=float)
+    gx = np.linspace(float(a), float(b), int(grid))
+    coeff = np.eye(m, dtype=float)
+    spl = BSpline(t, coeff, k, extrapolate=False, axis=0)
+    B = np.asarray(spl.derivative(deriv)(gx), dtype=float)
+    B[np.isnan(B)] = 0.0
     w = np.ones(gx.shape[0], dtype=float)
     w[0] *= 0.5
     w[-1] *= 0.5
@@ -396,40 +503,127 @@ def lambda_max_R(Phi, y, m, R):
     return lam
 
 
+def lambda_max_R_design(B, X, y, R):
+    """计算 lambda_max，但不显式构造 Phi。与 lambda_max_R(build_vcm_design(...)) 等价。"""
+    B = np.asarray(B, dtype=float)
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    L = _safe_cholesky(R)
+    g = (X * y[:, None]).T @ B
+    u = np.linalg.solve(L.T, g.T).T
+    return float(np.max(np.linalg.norm(u, axis=1)))
+
+
 def group_soft_thresh(blocks, tau, R, lam, w):
-    out = []
-    for v, wp in zip(blocks, w):
-        nr = float(np.sqrt(max(0.0, v.T @ R @ v)))
-        thr = tau * lam * wp
-        out.append(np.zeros_like(v) if nr <= thr else (1 - thr / nr) * v)
-    return out
+    block_mat = np.asarray(blocks, dtype=float)
+    if block_mat.ndim == 1:
+        block_mat = block_mat[None, :]
+    quad = np.einsum("ij,ij->i", block_mat @ R, block_mat)
+    norms = np.sqrt(np.maximum(quad, 0.0))
+    thresh = float(tau * lam) * np.asarray(w, dtype=float)
+    scale = np.zeros_like(norms)
+    active = norms > thresh
+    scale[active] = 1.0 - thresh[active] / norms[active]
+    out = block_mat * scale[:, None]
+    return [out[i].copy() for i in range(out.shape[0])]
 
 
-def fista_group_lasso(XtX, Xty, lam, m, P, R, w, max_iter=6000, tol=1e-7):
+def fista_group_lasso(XtX, Xty, lam, m, P, R, w, max_iter=6000, tol=1e-7, Ls=None, init=None):
     """显式 Gram 矩阵版 FISTA group-lasso（与 main.py 原始版本一致）。"""
+    m = int(m)
+    P = int(P)
     d = m * P
-    Ls = float(np.linalg.norm(XtX, 2))
-    Ls = Ls if (np.isfinite(Ls) and Ls > 0) else 1.0
+    if Ls is None:
+        Ls = _lipschitz_from_gram(XtX)
+    else:
+        Ls = float(Ls)
+        if (not np.isfinite(Ls)) or Ls <= 0:
+            Ls = 1.0
     step = 1.0 / Ls
 
-    c = np.zeros(d)
+    if init is None:
+        c = np.zeros(d, dtype=float)
+    else:
+        c = np.asarray(init, dtype=float).reshape(d).copy()
     z = c.copy()
     tN = 1.0
+    w = np.asarray(w, dtype=float)
 
-    for _ in range(max_iter):
+    for _ in range(int(max_iter)):
         grad = XtX @ z - Xty
-        yv = z - step * grad
-        yb = split_blocks(yv, m, P)
-        c_new = np.concatenate(group_soft_thresh(yb, step, R, lam, w))
+        yv_mat = _coef_to_block_matrix(z - step * grad, m, P)
+        quad = np.einsum("ij,ij->i", yv_mat @ R, yv_mat)
+        norms = np.sqrt(np.maximum(quad, 0.0))
+        thresh = step * float(lam) * w
+        scale = np.zeros_like(norms)
+        active = norms > thresh
+        scale[active] = 1.0 - thresh[active] / norms[active]
+        c_new = (yv_mat * scale[:, None]).reshape(d)
 
-        t_new = 0.5 * (1 + np.sqrt(1 + 4 * tN * tN))
-        z = c_new + (tN - 1) / t_new * (c_new - c)
+        t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * tN * tN))
+        z = c_new + ((tN - 1.0) / t_new) * (c_new - c)
 
         if norm(c_new - c) <= tol * max(1.0, norm(c)):
             return c_new
-        c, tN = c_new, t_new
+
+        c = c_new
+        tN = t_new
 
     return c
+
+
+def fista_group_lasso_design(B, X, y, lam, R, w, max_iter=6000, tol=1e-7, Ls=None, init=None):
+    """Implicit-design FISTA: compute gradients from B and X without materializing Phi."""
+    B = np.asarray(B, dtype=float)
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m = B.shape[1]
+    P = X.shape[1]
+    d = m * P
+
+    if Ls is None:
+        Ls = _estimate_lipschitz_design(B, X)
+    else:
+        Ls = float(Ls)
+        if (not np.isfinite(Ls)) or Ls <= 0:
+            Ls = 1.0
+    step = 1.0 / Ls
+
+    Xty_blocks = (X * y[:, None]).T @ B
+    if init is None:
+        c = np.zeros(d, dtype=float)
+    else:
+        c = np.asarray(init, dtype=float).reshape(d).copy()
+    z = c.copy()
+    tN = 1.0
+    w = np.asarray(w, dtype=float)
+
+    for _ in range(int(max_iter)):
+        z_mat = _coef_to_block_matrix(z, m, P)
+        grad_mat = _apply_smooth_gram(B, X, z_mat) - Xty_blocks
+        yv_mat = z_mat - step * grad_mat
+        quad = np.einsum("ij,ij->i", yv_mat @ R, yv_mat)
+        norms = np.sqrt(np.maximum(quad, 0.0))
+        thresh = step * float(lam) * w
+        scale = np.zeros_like(norms)
+        active = norms > thresh
+        scale[active] = 1.0 - thresh[active] / norms[active]
+        c_new = (yv_mat * scale[:, None]).reshape(d)
+
+        t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * tN * tN))
+        z = c_new + ((tN - 1.0) / t_new) * (c_new - c)
+
+        if norm(c_new - c) <= tol * max(1.0, norm(c)):
+            return c_new
+
+        c = c_new
+        tN = t_new
+
+    return c
+
+
+def _use_explicit_gram(B, X, max_dim=400):
+    return int(B.shape[1]) * int(X.shape[1]) <= int(max_dim)
 
 
 # =========================================================
@@ -451,7 +645,7 @@ def make_lambda_path(lam_max, n_lam=30, min_ratio=5e-4):
 
 
 def cv_select_lambda_plain(B, X, y, R, lam_path, K=5, seed=2025, use_1se=True):
-    """Stage 1 的 plain CV（无 frozen 部分），使用显式 Gram 矩阵。"""
+    """Stage 1 的 plain CV（无 frozen 部分）。"""
     n = len(y)
     P = X.shape[1]
     m = B.shape[1]
@@ -468,15 +662,41 @@ def cv_select_lambda_plain(B, X, y, R, lam_path, K=5, seed=2025, use_1se=True):
         Xtr, Xv = X[tr], X[val]
         ytr, yv = y[tr], y[val]
 
-        Phi_tr = build_vcm_design(Btr, Xtr)
-        Phi_v = build_vcm_design(Bv, Xv)
-        XtX = Phi_tr.T @ Phi_tr
-        Xty = Phi_tr.T @ ytr
         w_tr = group_weights(Btr, Xtr)
+        c_prev = np.zeros(m * P, dtype=float)
+        use_explicit = _use_explicit_gram(Btr, Xtr)
+        if use_explicit:
+            Phi_tr = build_vcm_design(Btr, Xtr)
+            Phi_v = build_vcm_design(Bv, Xv)
+            XtX = Phi_tr.T @ Phi_tr
+            Xty = Phi_tr.T @ ytr
+            Ls = _lipschitz_from_gram(XtX)
+        else:
+            Ls = _estimate_lipschitz_design(Btr, Xtr)
 
         for li, lam in enumerate(lam_path):
-            c = fista_group_lasso(XtX, Xty, float(lam), m, P, R, w_tr)
-            mse[li, kf] = float(np.mean((yv - Phi_v @ c) ** 2))
+            if use_explicit:
+                c = fista_group_lasso(
+                    XtX, Xty, float(lam), m, P, R, w_tr,
+                    Ls=Ls, init=c_prev,
+                )
+            else:
+                c = fista_group_lasso_design(
+                    Btr,
+                    Xtr,
+                    ytr,
+                    float(lam),
+                    R,
+                    w_tr,
+                    Ls=Ls,
+                    init=c_prev,
+                )
+            c_prev = c
+            if use_explicit:
+                y_pred = Phi_v @ c
+            else:
+                y_pred = _predict_from_coef_matrix(Bv, Xv, _coef_to_block_matrix(c, m, P))
+            mse[li, kf] = float(np.mean((yv - y_pred) ** 2))
 
     mm = mse.mean(axis=1)
     best = int(np.argmin(mm))
@@ -490,7 +710,6 @@ def cv_select_lambda_plain(B, X, y, R, lam_path, K=5, seed=2025, use_1se=True):
 def cv_select_lambda_frozen_cn(B_cn, X_cn, y_cn_res, R_cn, lam_path, K=5, seed=2025, use_1se=True):
     """
     真正增量的 Frozen-CV：只在 CN 区间数据上做交叉验证。
-    使用显式 Gram 矩阵版 FISTA。
 
     y_cn_res 已经是减去 frozen(O+C) 贡献后的残差。
     只需在优化区间的 basis 上做普通的 group-lasso CV。
@@ -511,15 +730,40 @@ def cv_select_lambda_frozen_cn(B_cn, X_cn, y_cn_res, R_cn, lam_path, K=5, seed=2
         Xtr, Xv = X_cn[tr], X_cn[val]
         ytr, yv = y_cn_res[tr], y_cn_res[val]
 
-        Phi_tr = build_vcm_design(Btr, Xtr)
-        Phi_v = build_vcm_design(Bv, Xv)
-        XtX = Phi_tr.T @ Phi_tr
-        Xty = Phi_tr.T @ ytr
         w_tr = group_weights(Btr, Xtr)
+        c_prev = np.zeros(m_cn * P, dtype=float)
+        use_explicit = _use_explicit_gram(Btr, Xtr)
+        if use_explicit:
+            Phi_tr = build_vcm_design(Btr, Xtr)
+            Phi_v = build_vcm_design(Bv, Xv)
+            XtX = Phi_tr.T @ Phi_tr
+            Xty = Phi_tr.T @ ytr
+            Ls = _lipschitz_from_gram(XtX)
+        else:
+            Ls = _estimate_lipschitz_design(Btr, Xtr)
 
         for li, lam in enumerate(lam_path):
-            c = fista_group_lasso(XtX, Xty, float(lam), m_cn, P, R_cn, w_tr)
-            y_pred = Phi_v @ c
+            if use_explicit:
+                c = fista_group_lasso(
+                    XtX, Xty, float(lam), m_cn, P, R_cn, w_tr,
+                    Ls=Ls, init=c_prev,
+                )
+            else:
+                c = fista_group_lasso_design(
+                    Btr,
+                    Xtr,
+                    ytr,
+                    float(lam),
+                    R_cn,
+                    w_tr,
+                    Ls=Ls,
+                    init=c_prev,
+                )
+            c_prev = c
+            if use_explicit:
+                y_pred = Phi_v @ c
+            else:
+                y_pred = _predict_from_coef_matrix(Bv, Xv, _coef_to_block_matrix(c, m_cn, P))
             mse[li, kf] = float(np.mean((yv - y_pred) ** 2))
 
     mm = mse.mean(axis=1)
@@ -732,7 +976,8 @@ class IncrementalVCMTrainer:
     - O 区间的系数冻结不动，误差计算只在 CN 区间上
     """
 
-    def __init__(self, k, knot_step, P, seed_cv=2025, use_1se=False, r_relax=0, adaptive=False, debug=False):
+    def __init__(self, k, knot_step, P, seed_cv=2025, use_1se=False, r_relax=0,
+                 adaptive=False, smooth_refit=False, smooth_alpha=0.0, debug=False):
         self.k = int(k)
         self.knot_step = float(knot_step)
         self.P = int(P)
@@ -740,6 +985,8 @@ class IncrementalVCMTrainer:
         self.use_1se = bool(use_1se)
         self.r_relax = int(r_relax)
         self.adaptive = bool(adaptive)
+        self.smooth_refit = bool(smooth_refit)
+        self.smooth_alpha = float(smooth_alpha)
         self.debug = bool(debug)
 
         self.t_end = None
@@ -760,6 +1007,8 @@ class IncrementalVCMTrainer:
             "use_1se": bool(self.use_1se),
             "r_relax": int(self.r_relax),
             "adaptive": bool(self.adaptive),
+            "smooth_refit": bool(self.smooth_refit),
+            "smooth_alpha": float(self.smooth_alpha),
         }
 
         coef_mat = np.stack(self.coef_blocks, axis=0)
@@ -787,6 +1036,8 @@ class IncrementalVCMTrainer:
             use_1se=meta["use_1se"],
             r_relax=meta.get("r_relax", 0),
             adaptive=meta.get("adaptive", False),
+            smooth_refit=meta.get("smooth_refit", False),
+            smooth_alpha=meta.get("smooth_alpha", 0.0),
             debug=debug,
         )
 
@@ -818,11 +1069,10 @@ class IncrementalVCMTrainer:
         B = bspline_design_matrix(t, self.knots, self.k)
         m = B.shape[1]
 
-        Phi = build_vcm_design(B, X)
         R = gram_R(self.knots, self.k, 0.0, 1.0)
         w_full = group_weights(B, X)
 
-        lam_max = lambda_max_R(Phi, y, m, R)
+        lam_max = lambda_max_R_design(B, X, y, R)
         lam_path = make_lambda_path(lam_max)
 
         lam_best = cv_select_lambda_plain(
@@ -830,10 +1080,39 @@ class IncrementalVCMTrainer:
             K=5, seed=self.seed_cv, use_1se=self.use_1se,
         )
 
-        c = fista_group_lasso(Phi.T @ Phi, Phi.T @ y, lam_best, m, self.P, R, w_full)
+        Phi = None
+        if _use_explicit_gram(B, X):
+            Phi = build_vcm_design(B, X)
+            XtX = Phi.T @ Phi
+            Xty = Phi.T @ y
+            c = fista_group_lasso(
+                XtX, Xty, lam_best, m, self.P, R, w_full,
+                Ls=_lipschitz_from_gram(XtX),
+            )
+            yhat = Phi @ c
+        else:
+            c = fista_group_lasso_design(
+                B,
+                X,
+                y,
+                lam_best,
+                R,
+                w_full,
+                Ls=_estimate_lipschitz_design(B, X),
+            )
+            yhat = _predict_from_coef_matrix(B, X, _coef_to_block_matrix(c, m, self.P))
+
+        smooth_active = None
+        if self.smooth_refit and self.smooth_alpha > 0:
+            if Phi is None:
+                Phi = build_vcm_design(B, X)
+            R_smooth = roughness_R(self.knots, self.k, 0.0, 1.0)
+            c, smooth_active = smooth_refit_active(
+                Phi, y, c, m, self.P, R_smooth, self.smooth_alpha
+            )
+            yhat = Phi @ c
         self.coef_blocks = split_blocks(c, m, self.P)
 
-        yhat = Phi @ c
         rmse = float(np.sqrt(np.mean((y - yhat) ** 2)))
 
         return {
@@ -842,6 +1121,7 @@ class IncrementalVCMTrainer:
             "m": int(m),
             "lambda_best": float(lam_best),
             "train_rmse": rmse,
+            "smooth_active_vars": int(len(smooth_active)) if smooth_active is not None else None,
         }
 
     def extend_one_stage(self, next_end, t_cn, X_cn, y_cn):
@@ -925,14 +1205,11 @@ class IncrementalVCMTrainer:
         R_full = gram_R(knots_new, self.k, 0.0, next_end)
         R_cn = R_full[np.ix_(idx_cn, idx_cn)]
 
-        # VCM 设计矩阵
-        Phi_cn = build_vcm_design(B_cn_data_cn, X_cn)
-
         # group weights
         w_cn = group_weights(B_cn_data_cn, X_cn)
 
         # lambda 路径
-        lam_max = lambda_max_R(Phi_cn, y_cn_res, m_cn, R_cn)
+        lam_max = lambda_max_R_design(B_cn_data_cn, X_cn, y_cn_res, R_cn)
         lam_path = make_lambda_path(lam_max)
 
         # CV 选择 lambda（只在 CN 数据上做 CV）
@@ -948,10 +1225,25 @@ class IncrementalVCMTrainer:
         )
 
         # 初始 CN 拟合
-        c_cn_vec = fista_group_lasso(
-            Phi_cn.T @ Phi_cn, Phi_cn.T @ y_cn_res,
-            lam_best, m_cn, self.P, R_cn, w_cn,
-        )
+        Phi_cn = None
+        if _use_explicit_gram(B_cn_data_cn, X_cn):
+            Phi_cn = build_vcm_design(B_cn_data_cn, X_cn)
+            XtX_cn = Phi_cn.T @ Phi_cn
+            Xty_cn = Phi_cn.T @ y_cn_res
+            c_cn_vec = fista_group_lasso(
+                XtX_cn, Xty_cn, lam_best, m_cn, self.P, R_cn, w_cn,
+                Ls=_lipschitz_from_gram(XtX_cn),
+            )
+        else:
+            c_cn_vec = fista_group_lasso_design(
+                B_cn_data_cn,
+                X_cn,
+                y_cn_res,
+                lam_best,
+                R_cn,
+                w_cn,
+                Ls=_estimate_lipschitz_design(B_cn_data_cn, X_cn),
+            )
 
         # Adaptive refit（可选）
         lam_ad = None
@@ -962,6 +1254,27 @@ class IncrementalVCMTrainer:
             )
         else:
             c_cn_use = c_cn_vec
+
+        smooth_active = None
+        if self.smooth_refit and self.smooth_alpha > 0:
+            if Phi_cn is None:
+                Phi_cn = build_vcm_design(B_cn_data_cn, X_cn)
+            R2_full = roughness_R(knots_new, self.k, 0.0, next_end)
+            R2_cn = R2_full[np.ix_(idx_cn, idx_cn)]
+            R2_cn_o = R2_full[np.ix_(idx_cn, idx_o_new)]
+            penalty_rhs = np.zeros_like(c_cn_use)
+            for p in range(self.P):
+                penalty_rhs[p * m_cn:(p + 1) * m_cn] = R2_cn_o @ c_o_mat[p]
+            c_cn_use, smooth_active = smooth_refit_active(
+                Phi_cn,
+                y_cn_res,
+                c_cn_use,
+                m_cn,
+                self.P,
+                R2_cn,
+                self.smooth_alpha,
+                penalty_rhs=penalty_rhs,
+            )
 
         # 组装完整系数向量
         blocks_cn = split_blocks(c_cn_use, m_cn, self.P)
@@ -978,7 +1291,16 @@ class IncrementalVCMTrainer:
         self.coef_blocks = coef_new
 
         # RMSE 只在 CN 数据上计算
-        yhat_cn = frozen_y + Phi_cn @ c_cn_use
+        if Phi_cn is not None:
+            yhat_cn = frozen_y + Phi_cn @ c_cn_use
+        elif _use_explicit_gram(B_cn_data_cn, X_cn):
+            yhat_cn = frozen_y + build_vcm_design(B_cn_data_cn, X_cn) @ c_cn_use
+        else:
+            yhat_cn = frozen_y + _predict_from_coef_matrix(
+                B_cn_data_cn,
+                X_cn,
+                _coef_to_block_matrix(c_cn_use, m_cn, self.P),
+            )
         rmse_cn = float(np.sqrt(np.mean((y_cn - yhat_cn) ** 2)))
 
         return {
@@ -995,6 +1317,7 @@ class IncrementalVCMTrainer:
             "lambda_best": float(lam_best),
             "lambda_ad": float(lam_ad) if lam_ad is not None else None,
             "train_rmse_cn": rmse_cn,
+            "smooth_active_vars": int(len(smooth_active)) if smooth_active is not None else None,
         }
 
     def predict(self, t, X):
@@ -1075,6 +1398,8 @@ def run_or_resume_incremental(
     use_1se=False,
     r_relax=0,
     adaptive=False,
+    smooth_refit=False,
+    smooth_alpha=0.0,
     debug=False,
     heartbeat_sec=90.0,
     progress_hook=None,
@@ -1109,7 +1434,18 @@ def run_or_resume_incremental(
     prev_seg_y = None
 
     if start_end is None:
-        trainer = IncrementalVCMTrainer(k=k, knot_step=knot_step, P=P, seed_cv=seed_cv, use_1se=use_1se, r_relax=r_relax, adaptive=adaptive, debug=debug)
+        trainer = IncrementalVCMTrainer(
+            k=k,
+            knot_step=knot_step,
+            P=P,
+            seed_cv=seed_cv,
+            use_1se=use_1se,
+            r_relax=r_relax,
+            adaptive=adaptive,
+            smooth_refit=smooth_refit,
+            smooth_alpha=smooth_alpha,
+            debug=debug,
+        )
         hb_thread = _start_heartbeat_watcher(
             "main1",
             stage_getter=lambda: trainer.t_end or 0.0,
@@ -1228,7 +1564,7 @@ def _resolve_checkpoint_base(checkpoint_dir, root="checkpoints"):
 
 
 def _load_config(path):
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         return json.load(f)
 
 
@@ -1316,6 +1652,10 @@ def main():
     parser.add_argument("--use-1se", type=_str2bool, default=False)
     parser.add_argument("--r-relax", type=int, default=0, help="Number of bases near boundary to release from freezing.")
     parser.add_argument("--adaptive", type=_str2bool, default=False, help="Enable adaptive group-lasso refit.")
+    parser.add_argument("--smooth-refit", type=_str2bool, default=False,
+                        help="Refit selected groups with a second-derivative roughness penalty.")
+    parser.add_argument("--smooth-alpha", type=float, default=0.0,
+                        help="Roughness penalty weight used when --smooth-refit is true.")
 
     parser.add_argument("--history-json", default="")
     parser.add_argument("--debug", type=_str2bool, default=False)
@@ -1400,6 +1740,8 @@ def main():
         use_1se=bool(_get_cfg(cfg, "train", "use_1se", args.use_1se)),
         r_relax=int(_get_cfg(cfg, "train", "r_relax", args.r_relax)),
         adaptive=bool(_get_cfg(cfg, "train", "adaptive", args.adaptive)),
+        smooth_refit=bool(_get_cfg(cfg, "train", "smooth_refit", args.smooth_refit)),
+        smooth_alpha=float(_get_cfg(cfg, "train", "smooth_alpha", args.smooth_alpha)),
         debug=bool(_get_cfg(cfg, "train", "debug", args.debug)),
         heartbeat_sec=float(_get_cfg(cfg, "train", "heartbeat_sec", args.heartbeat_sec)),
         progress_hook=_progress,
@@ -1431,6 +1773,7 @@ def main():
     else:
         history_json = _get_cfg(cfg, "experiment", "history_json", "")
     if history_json:
+        os.makedirs(os.path.dirname(history_json) or ".", exist_ok=True)
         with open(history_json, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
 
