@@ -1311,7 +1311,7 @@ def main():
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--knot-step", type=float, default=0.1)
 
-    parser.add_argument("--seed-data", type=int, default=0)
+    parser.add_argument("--seed-data", type=int, default=None)
     parser.add_argument("--seed-cv", type=int, default=2025)
     parser.add_argument("--use-1se", type=_str2bool, default=False)
     parser.add_argument("--r-relax", type=int, default=0, help="Number of bases near boundary to release from freezing.")
@@ -1342,7 +1342,11 @@ def main():
         beta_funcs = build_beta_functions_from_config(beta_cfg)
 
     checkpoint_root = _get_cfg(cfg, "experiment", "checkpoint_root", "checkpoints")
-    checkpoint_dir_cfg = _get_cfg(cfg, "experiment", "checkpoint_dir", args.checkpoint_dir)
+    # 命令行 --checkpoint-dir 优先于 config（parallel.py 会为每个 seed 传入独立目录）
+    if args.checkpoint_dir:
+        checkpoint_dir_cfg = args.checkpoint_dir
+    else:
+        checkpoint_dir_cfg = _get_cfg(cfg, "experiment", "checkpoint_dir", "")
     tag_cfg = _get_cfg(cfg, "experiment", "tag", args.tag)
 
     if checkpoint_dir_cfg:
@@ -1391,7 +1395,7 @@ def main():
         sigma=float(_get_cfg(cfg, "data", "sigma", args.sigma)),
         k=int(_get_cfg(cfg, "model", "k", args.k)),
         knot_step=float(_get_cfg(cfg, "model", "knot_step", args.knot_step)),
-        seed_data=int(_get_cfg(cfg, "data", "seed_data", args.seed_data)),
+        seed_data=int(args.seed_data if args.seed_data is not None else _get_cfg(cfg, "data", "seed_data", 0)),
         seed_cv=int(_get_cfg(cfg, "train", "seed_cv", args.seed_cv)),
         use_1se=bool(_get_cfg(cfg, "train", "use_1se", args.use_1se)),
         r_relax=int(_get_cfg(cfg, "train", "r_relax", args.r_relax)),
@@ -1421,7 +1425,11 @@ def main():
             "min_stage_sec": timing_stats["min_stage_sec"],
         })
 
-    history_json = _get_cfg(cfg, "experiment", "history_json", args.history_json)
+    # 命令行 --history-json 优先于 config
+    if args.history_json:
+        history_json = args.history_json
+    else:
+        history_json = _get_cfg(cfg, "experiment", "history_json", "")
     if history_json:
         with open(history_json, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)

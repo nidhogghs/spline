@@ -1,0 +1,81 @@
+{
+  "experiment": {
+    "checkpoint_root": "checkpoints",
+    "checkpoint_dir": "longcycle_shift_beta2",
+    "history_json": ""
+  },
+  "model": {
+    "P": 100,
+    "k": 3,
+    "knot_step": 0.1,
+    "signal_idx": [1, 2, 3, 4, 5],
+    "beta": {
+      "specs": [
+        {
+          "_comment": "beta1: -0.5 + 0.6*cos(2*pi*t) + 0.15*ln(1+0.3t) — 与 default 一致",
+          "type": "trig_mix",
+          "bias": -0.5,
+          "terms": [
+            {"kind": "cos", "amplitude": 0.6, "frequency_pi": 2.0}
+          ],
+          "log_tail": {
+            "start": 0.0,
+            "amplitude": 0.15,
+            "slope": 0.3,
+            "sign": 1.0
+          }
+        },
+        {
+          "_comment": "beta2: -0.5 + 0.6*cos(2*pi*t) + 0.2*sin(0.2*pi*t) — 原始 + 大周期偏移",
+          "type": "trig_mix",
+          "bias": -0.5,
+          "terms": [
+            {"kind": "cos", "amplitude": 0.6, "frequency_pi": 2.0},
+            {"kind": "sin", "amplitude": 0.2, "frequency_pi": 0.2}
+          ]
+        },
+        {
+          "_comment": "beta3: 0.7*sin(4*pi*t) — 与 default 一致",
+          "type": "sin",
+          "amplitude": 0.7,
+          "frequency_pi": 4.0,
+          "phase": 0.0,
+          "bias": 0.0
+        },
+        {
+          "_comment": "beta4: 0.7*sin(4*pi*t) — 与 default 一致",
+          "type": "sin",
+          "amplitude": 0.7,
+          "frequency_pi": 4.0,
+          "phase": 0.0,
+          "bias": 0.0
+        },
+        {
+          "_comment": "beta5: 0.4*cos(3*pi*t) — 与 default 一致",
+          "type": "cos",
+          "amplitude": 0.4,
+          "frequency_pi": 3.0,
+          "phase": 0.0,
+          "bias": 0.0
+        }
+      ]
+    }
+  },
+  "data": {
+    "t_final": 100,
+    "n_per_segment": 300,
+    "sigma": 0.1,
+    "seed_data": 0
+  },
+  "train": {
+    "seed_cv": 2025,
+    "use_1se": false,
+    "r_relax": 0,
+    "adaptive": false,
+    "debug": false,
+    "heartbeat_sec": 120.0
+  },
+  "run": {
+    "load_only": false
+  }
+}
